@@ -21,6 +21,44 @@ defaults `--sigs` to `./BedrockTools-main/src/core/memory/Signatures.cpp`, and
 `AGENTS.md` names it as the method source. Renaming it silently breaks the
 default.
 
+## Sandbox-only checkouts (not in git)
+
+These live in `/home/user/refs/`, outside the repo, so they are readable but
+carry no history here. `/home/user` is the workspace root, so they persist in a
+snapshot; they are not committed.
+
+| Checkout | Size | Role |
+|---|---|---|
+| `BedrockTools_skill/` @ `2551791` | 752 KB, 70 files | the upstream the `skills/` tree was copied from |
+| `BedrockTools/` @ `b0ed3e9` | 1.5 MB, 173 files | upstream of `BedrockTools-main/` |
+| `LeviLamroid/` @ `f988a23` | 23 MB, 759 files | **secondary reference only** — see `LEVILAMROID.md` |
+
+All three are `--depth 1` clones, so `git log` shows exactly one commit each and
+**no history**. Anything phrased as "commit X changed Y" is not derivable here;
+only the state at HEAD is.
+
+`LeviLamroid` is deliberately *not* vendored. It resolves game functions by
+golden-RVA table, which fails silently on an unlisted build, whereas the method
+source resolves by byte signature and fails loudly. Keeping it out of the repo
+avoids implying it is an alternative methodology — the workspace `AGENTS.md`
+rule that non-BedrockTools projects are build-environment references only stands
+unchanged. `LEVILAMROID.md` audits its `AGENTS.md` against the source and lists
+what is worth borrowing (`ll/api`, the standalone AArch64 trampoline, the
+ImGui 1.91.8 GLES3 backend, `template/`) and what is not.
+
+## Licensing across the three trees
+
+They do not agree, and one contradicts itself:
+
+| Tree | Declared |
+|---|---|
+| the skill | GPL-3.0 (`LICENSE`, `NOTICE`) |
+| `BedrockTools-main/` | `LICENSE` says **MIT**; `README.md:104` says **GPL-3.0**. The tip commit is titled "chore: update license from GPL to MIT", which makes MIT the intent and the README stale — but with a depth-1 clone that is inference from the title, not a verified history. |
+| `LeviLamroid/` | LGPL-3.0 (`LICENSE` == `COPYING.LESSER`, md5 `3000208d…`; GPL-3.0 text also shipped as `COPYING.txt`; `NOTICE.md` says LGPL-3.0) |
+
+Treat the `BedrockTools-main` README as wrong until upstream fixes it, and do not
+re-license anything vendored here without checking the upstream file directly.
+
 ## Dependencies installed here
 
 ```sh

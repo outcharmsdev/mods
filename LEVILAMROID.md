@@ -140,13 +140,43 @@ specifically because hard-coded displacements fail silently — the exact risk t
 RVA-table design takes on. Both designs are defensible; they should not be mixed
 without deciding which one wins for a given deliverable.
 
-The workspace `AGENTS.md` currently says:
+The workspace `AGENTS.md` says:
 
 > **Method source**: use `BedrockTools-main` … Other mod projects in the workspace
 > may be used only as build-environment references, never as the methodology
 > source for deliverables.
 
-Adopting this document as the workspace `AGENTS.md` would reverse that rule.
+**Resolved: LeviLamroid is a secondary reference.** That rule stands unchanged —
+the skill plus `BedrockTools-main` remain the method source for anything this
+workspace produces, and the pasted `AGENTS.md` was *not* installed over the
+existing one. The repo is kept in the sandbox only, not vendored into git.
+
+## What to borrow from it, and what not to
+
+Worth taking as a build/API reference:
+
+* `include/ll/api/` — a LeviLamina-parity C++ surface (`memory/`, `event/`,
+  `mod/`, `Logger.h`). Useful when a mod should read like a LeviLamina plugin.
+* `src/memory/Hook.cpp` — a self-contained AArch64 inline trampoline and GOT
+  patcher, for when no external hook engine is available.
+* `include/imgui/` + `imgui_impl_opengl3` — a working Dear ImGui 1.91.8 GLES3
+  Android backend, which neither the skill nor BedrockTools ships.
+* `template/` — a complete C++20 mod starter with CMake, manifest, HUD button
+  and packaging.
+* The §6 audio/texture option split (FMOD in-memory playback vs. hooking
+  `SoundEngine::play`; `uploadTexture` vs. `InMemoryPackAccessStrategy`) is a
+  good design vocabulary even if the RVAs behind it are not used.
+
+Do **not** take:
+
+* the golden-RVA resolution strategy — it fails silently on an unlisted build,
+  which is the failure mode `scripts/offset_check.py` and
+  `references/version-porting.md` exist to catch;
+* the Build-ID prefix table as a substitute for signature verification — it is
+  incomplete as documented (see §3.1 above);
+* the `ModRegistration` shape from the document — use `include/pl/Mod.hpp`
+  directly.
+
 
 ## Not verified
 
