@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Analysis databases -- multi-GB, never a deliverable (see AGENTS.md §2)
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.gpr
+*.rep/
+*.gdb/
+
+# Generated reports and scratch output
+sig_report.json
+elf_facts.json
+hits.json
+*.levipack
+
+# Build output
+build/
+.xmake/
+*.o
+*.so
+!skills/assets/**/*.so
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

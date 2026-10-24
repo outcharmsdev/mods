@@ -1,0 +1,19 @@
+# Python dependencies for skills/scripts/.
+#
+# Only three of the twelve tools need anything beyond the standard library
+# (see README.md "Requirements"):
+#
+#   a64.py, mksig.py, offset_check.py, sigscan.py, multi_verify.py  -> numpy + capstone
+#
+# Everything else (verify_signatures.py, elf_facts.py, vtable_walk.py,
+# package_levipack.py, aarch64_enc.py, ida_mcp_client.py) is stdlib only.
+#
+# Install with:
+#   pip install -r requirements.txt
+# On a distro-managed Python (Debian/Ubuntu) add --break-system-packages, or use
+# a venv. See SETUP.md.
+numpy>=1.24
+capstone>=5.0
+
+# Optional, only for the icon pipeline in references/hud-buttons-and-icon-art.md
+# Pillow>=10.0

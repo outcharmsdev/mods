@@ -1,0 +1,2004 @@
+diff -ruN a/scripts/host_test.sh b/scripts/host_test.sh
+--- a/scripts/host_test.sh	2026-10-24 15:37:26.530643890 +0000
++++ b/scripts/host_test.sh	2026-10-24 15:55:50.746920388 +0000
+@@ -17,6 +17,37 @@
+ g++ -std=c++20 -O1 -g -Wall -Wextra $SAN -pthread -o build/hookchain_test tests/compat/hookchain_test.cpp
+ build/hookchain_test
+ 
++# 2b) Phase 0: diagnostics window, chain-wait behaviour, centralised offsets
++g++ -std=c++20 -O1 -g -Wall -Wextra $SAN -pthread -o build/hookchain_phase0_test tests/compat/hookchain_phase0_test.cpp
++build/hookchain_phase0_test
++g++ -std=c++20 -O1 -g -Wall -Wextra $SAN -Isrc -o build/perf_test tests/perf_test.cpp src/Perf.cpp
++build/perf_test
++g++ -std=c++20 -O1 -g -Wall -Wextra $SAN -Isrc -o build/offsets_test tests/compat/offsets_test.cpp
++build/offsets_test
++
++# 2c) Phase 1: the four rendering components. Each is engine-free, so these run with no game, no
++#     device and no NDK - which is the whole point of the split.
++for t in geometry meshstate lod backend; do
++  g++ -std=c++20 -O1 -g -Wall -Wextra $SAN -Isrc -o build/render_$t tests/render/${t}_test.cpp
++  build/render_$t
++done
++# mutation: commit() is the only way a chunk becomes drawable. If it stopped requiring a build in
++# flight, partial geometry could reach the renderer, and the lifecycle suite must catch that.
++rm -rf build/rmut; mkdir -p build/rmut/render; cp src/render/*.hpp build/rmut/render/
++python3 - build/rmut/render/HoloMeshState.hpp <<'MUTPY'
++import sys
++p = sys.argv[1]
++s = open(p).read()
++a = "inline bool commit(SlotState &s, uint32_t frame) {\n  if (!s.building) return false;"
++b = "inline bool commit(SlotState &s, uint32_t frame) {\n  if (false) return false;"
++if a not in s:
++    sys.exit("FAIL render mutation did not apply")
++open(p, "w").write(s.replace(a, b, 1))
++MUTPY
++g++ -std=c++20 -O1 -Ibuild/rmut -o build/rmut/t tests/render/meshstate_test.cpp
++if build/rmut/t >build/rmut/out.txt 2>&1; then echo "FAIL meshstate commit-guard mutation not detected"; exit 1; fi
++echo "meshstate mutation: detected ($(tail -1 build/rmut/out.txt))"
++
+ # 3) resolver: hooked-entry identity rules (2.0.2 backport)
+ g++ -std=c++20 -O1 -g -Wall -Wextra $SAN -Isrc -o build/resolver_rules_test tests/compat/resolver_rules_test.cpp
+ REF_SO="${REF_SO:-$HOME/ref/game/libminecraftpe.so}"
+@@ -174,7 +205,8 @@
+ python3 - <<'PY'
+ import re, sys
+ bad = []
+-for f in ("src/CyanStyle.hpp", "src/Paste.hpp"):
++for f in ("src/CyanStyle.hpp", "src/Paste.hpp", "src/render/HoloGeometry.hpp",
++          "src/render/HoloMeshState.hpp", "src/render/HoloLod.hpp", "src/render/HoloBackend.hpp"):
+     s = open(f).read()
+     for pat in (r"\bgl[A-Z]\w*\s*\(", r"\begl\w*\s*\(", r"\bdlopen\b", r"\bdlsym\b", r"GLES", r"memory::Hook", r"pl::hook"):
+         if re.search(pat, s):
+diff -ruN a/src/Hologram.cpp b/src/Hologram.cpp
+--- a/src/Hologram.cpp	2026-10-24 15:59:11.378604564 +0000
++++ b/src/Hologram.cpp	2026-10-24 15:52:50.155604220 +0000
+@@ -21,6 +21,12 @@
+ #include "Progress.hpp"
+ #include "Transformed.hpp"
+ #include "PlayerContext.hpp"
++// Phase 1: rendering split into separately testable components. Each is engine-free so it can be
++// exercised on the host; see src/render/ and tests/render/.
++#include "render/HoloGeometry.hpp"
++#include "render/HoloMeshState.hpp"
++#include "render/HoloLod.hpp"
++#include "render/HoloBackend.hpp"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -1378,17 +1384,45 @@
+   float bcx = 0, bcy = 0, bcz = 0;  
+   std::vector<uint64_t> special;  
+   std::vector<uint32_t> edges;    // cyan style: block-grid edges of the textured blocks (cyan::packEdge)
+-  bool built = false;             
+-  bool dirty = true;              
+-  uint32_t builtFrame = 0, seenFrame = 0;
++  // Mesh lifecycle, owned by render/HoloMeshState.hpp so the transitions are tested rather than
++  // implied. Replaces the previous built/dirty/builtFrame triple: `drawable()` is what `built` meant,
++  // `readyFrame` is what `builtFrame` meant, and the single `dirty` flag is now a mask that
++  // distinguishes a world change from mere camera movement.
++  holo::mesh::SlotState slot;
++  uint32_t seenFrame = 0;
+ };
++
++// What a chunk needs next, in the workload policy's terms. A chunk that was never built outranks one
++// whose geometry merely went stale, which outranks one that only needs a view refresh.
++inline holo::lod::Need needOf(const holo::mesh::SlotState &s) {
++  if (!s.hasPublished) return holo::lod::Need::First;
++  if (s.hasWorldInvalidation()) return holo::lod::Need::World;
++  if (s.invalid != holo::mesh::InvalidNone) return holo::lod::Need::View;
++  return holo::lod::Need::None;
++}
+ std::unordered_map<uint64_t, ChunkMeshes> gChunks;
+ uint64_t gChunkSig = 0;
+ // Mesh budget: hard cap on live hologram meshes (nearest chunks are built first).
+ constexpr uint32_t kMaxMeshes = 6000;
+ constexpr int kMaxBuildsPerFrame = 2;   // 首建也限流，避免一帧摊太多
+-constexpr int kMaxRebuildsPerFrame = 1; // 走位引起的重建：每帧只重建一块
++constexpr int kMaxRebuildsPerFrame = 1;
++// Frames a resumable build may stay in flight before it is presumed abandoned.
++constexpr uint32_t kBuildStallFrames = 120; // 走位引起的重建：每帧只重建一块
+ uint32_t gMeshTotal = 0;
++// Phase 1: per-frame workload policy (render/HoloLod.hpp). The ceilings are counted in blocks and
++// vertices rather than in wall-clock time, so they can be checked *between* blocks. A time budget can
++// only ever be consulted after the work is done, which is precisely why the previous 2.5 ms guard
++// bounded the number of chunks started per frame but never the cost of any single chunk.
++holo::lod::Scheduler gSched;
++// Which ceiling stopped the build this frame, for the diagnostics line.
++holo::lod::Stop gBuildStop = holo::lod::Stop::None;
++// Diagnostic switch: force the immediate-geometry backend even when the mesh pipeline resolved fine.
++// Useful when the hologram renders wrongly and it needs to be established whether the geometry or the
++// mesh submission is at fault. Not yet surfaced in the settings UI.
++std::atomic<bool> gForceWire{false};
++// Which backend this frame used, and why. Reported in the diagnostics line so a silent fallback
++// cannot pass for normal operation.
++holo::backend::Decision gBackend;
+ // Per-frame results of drawStructure (render thread only).
+ struct FrameOut {
+   bool texOn = false, outOfRange = false, capped = false, texPending = false;
+@@ -1425,6 +1459,8 @@
+   for (auto &kv : gChunks) {
+     for (MeshBlob *m : kv.second.meshes) delete m;
+     kv.second.meshes.clear();
++    // The handles belonged to a dead context, so they must not stay drawable.
++    holo::mesh::discardPublished(kv.second.slot);
+   }
+   gChunks.clear();
+   for (auto &e : gGraveyard) delete e.first;
+@@ -1543,6 +1579,17 @@
+                       : cyanStyle ? cyan::alphaFor(s.alpha.load())
+                                   : std::clamp(s.alpha.load(), 0.05f, 1.f);
+   const bool texOn = tf && tf->ok && T.vidx.size() == T.volume() && !T.variants.empty();
++  // Backend selection, from what the resolver actually found rather than what is assumed. Every
++  // capability here is a pointer the existing resolver already fills in; nothing new is required of
++  // the engine, and an unresolved one degrades to immediate geometry instead of crashing.
++  {
++    holo::backend::Capabilities caps;
++    caps.tessellate = sTessInWorld && sVertex;
++    caps.meshPipeline = meshReady();
++    caps.materials = texReady();
++    caps.forceWire = gForceWire.load(std::memory_order_relaxed);
++    gBackend = holo::backend::decide(caps, holo::backend::Kind::Mesh);
++  }
+   if (texOn && !updateTexCache(S, P.rot, P.mirror, untag(region))) {
+     // Still resolving block variants: show the outline only, build meshes once every variant is known.
+     gOut.texOn = true;
+@@ -1584,7 +1631,7 @@
+       freeAllChunks();
+     } else if (a8 != lastAlpha) {
+       for (auto &kv : gChunks) {
+-        kv.second.dirty = true;  
++        holo::mesh::invalidate(kv.second.slot, holo::mesh::InvalidWorld);  
+         perf::count(perf::InvAlpha);
+       }
+     } else if (pf[0] != sx0 || pf[1] != sx1 || pf[2] != sy0 || pf[3] != sy1 || pf[4] != sz0 || pf[5] != sz1) {
+@@ -1605,7 +1652,7 @@
+           }
+         }
+         if (hit) {
+-          kv.second.dirty = true;
++          holo::mesh::invalidate(kv.second.slot, holo::mesh::InvalidWorld);
+           perf::count(perf::InvFilter);
+         }
+       }
+@@ -1689,7 +1736,7 @@
+           if ((ax && (qx >> 4) == (wx >> 4)) || (ay && (qy >> 4) == (wy >> 4)) || (az && (qz >> 4) == (wz >> 4)))
+             continue;
+           auto it = gChunks.find(chunkKey(qx >> 4, qy >> 4, qz >> 4));
+-          if (it != gChunks.end()) it->second.dirty = true;
++          if (it != gChunks.end()) holo::mesh::invalidate(it->second.slot, holo::mesh::InvalidWorld);
+           // Counted per chunk actually invalidated, not per block change: one kind change can fan out to
+           // up to 8 chunks, and it is the chunk count that drives the rebuild cost.
+           if (it != gChunks.end()) perf::count(perf::InvCompare);
+@@ -1917,28 +1964,61 @@
+   };
+ 
+   
+-  auto buildChunk = [&](int qx, int qy, int qz, ChunkMeshes &cm) {
++  // A chunk build is resumable. The unit of work is one y-slab of the chunk (at most 16x16 blocks),
++  // which is small enough to bound a frame and large enough that a slab is never left half done. The
++  // staging vectors below survive across frames, and the chunk's published mesh is untouched until
++  // the whole build commits, so partial geometry is never drawn.
++  //
++  // Only one build is in flight at a time - the scheduler allows one start and one resume per frame
++  // and a resume always refers to the chunk already in flight - so a single set of statics suffices
++  // and nothing is allocated per chunk.
++  auto buildChunk = [&](int qx, int qy, int qz, ChunkMeshes &cm, holo::lod::Need need, bool resuming,
++                        double frameT0) {
+     const uint64_t buildT0 = monoUs();
+-    const bool wasBuilt = cm.built;   // a rebuild is strictly more expensive than a first build
++    const bool wasBuilt = cm.slot.drawable();  // a rebuild is strictly more expensive than a first build
+     static uintptr_t win[kWin * kWin * kWin];
+     static uint8_t winOcc[kWin * kWin * kWin];
++    static uint64_t sBuildKey = 0;
++    static bool sBuildActive = false;
++    static int sStartY = 0, sBlocks0 = 0, sSxs = 1, sSys = 1, sSzs = 1;
++    static uint32_t sVerts0 = 0;
++    static float sCcx = 0, sCcy = 0, sCcz = 0;
++    const uint64_t buildKey = chunkKey(qx, qy, qz);
++    const bool starting = !(sBuildActive && sBuildKey == buildKey);
+     // Reused scratch (render thread only): after the swaps below they hold the chunk's previous, already
+     // emptied storage, so steady-state rebuilds allocate nothing here.
+     static std::vector<MeshBlob *> fresh;
+     static std::vector<uint64_t> special;
+     static std::vector<uint32_t> edges;  // cyan style; swapped into the chunk like `special`
+-    fresh.clear();
+-    special.clear();
+-    edges.clear();
+     const int ox = qx * 16, oy = qy * 16, oz = qz * 16;
+     tf->ox = ox; tf->oy = oy; tf->oz = oz;
+     tf->cull = tf->alpha < 0xFF;
+-    tf->ccx = cam.x - ox; tf->ccy = cam.y - oy; tf->ccz = cam.z - oz;
++    // The cull band is relative to the camera position the build STARTED at. Restoring it on resume
++    // keeps one chunk's mesh internally consistent instead of mixing two camera positions in it.
++    tf->ccx = starting ? cam.x - ox : sCcx;
++    tf->ccy = starting ? cam.y - oy : sCcy;
++    tf->ccz = starting ? cam.z - oz : sCcz;
++    if (starting) {
++      sCcx = tf->ccx; sCcy = tf->ccy; sCcz = tf->ccz;
++      fresh.clear();
++      special.clear();
++      edges.clear();
++    }
++    // Re-pointed every frame: tf is per-frame, the staging is not.
+     tf->out = &fresh;
+-    const int blocks0 = tf->blocks;
+-    const uint32_t verts0 = tf->verts;
+-    
+-    
++    if (starting) {
++      sBlocks0 = tf->blocks;
++      sVerts0 = tf->verts;
++    }
++    const int blocks0 = sBlocks0;
++    const uint32_t verts0 = sVerts0;
++
++    // A build may only span frames when the getBlock hook can answer for the window, because the
++    // BlockTessellator cache prefilled below is reset by texFrameEnd at the end of every frame. With
++    // the hook installed the window is still answered correctly from gWinBlk; without it the whole
++    // chunk is built in one pass, exactly as before.
++    const bool canSpanFrames = sGetBlockHooked.load(std::memory_order_acquire) && tf->region != 0;
++    if (starting) {
+     sBTReset(reinterpret_cast<void *>(tf->bt), BlockPos{ox, oy, oz});
+     std::memset(win, 0, sizeof(win));
+     std::memset(gWinBlk, 0, sizeof(gWinBlk));
+@@ -1992,6 +2072,16 @@
+             sBTSetCache(reinterpret_cast<void *>(tf->bt), reinterpret_cast<void *>(sb), BlockPos{wx, wy, wz});
+         }
+     if (winT0) perf::count(perf::HoloWindowUs, monoUs() - winT0);
++      holo::mesh::beginBuild(cm.slot, gFrame);
++      sBuildActive = true;
++      sBuildKey = buildKey;
++      sStartY = 0;
++      sSxs = cam.x < ox + 8 ? -1 : 1;
++      sSys = cam.y < oy + 8 ? -1 : 1;
++      sSzs = cam.z < oz + 8 ? -1 : 1;
++    }
++    // gWinBlk and its bounds are read by the getBlock detour, so they are re-published every frame of
++    // a multi-frame build, not only on the first.
+     gWinX0 = ox - 2; gWinY0 = oy - 2; gWinZ0 = oz - 2;
+     gWinRegion = tf->region;
+     gWinTid = pthread_self();
+@@ -2000,7 +2090,7 @@
+     const int by0c = std::max(oy, sy0), by1c = std::min(oy + 15, sy1);
+     const int bz0c = std::max(oz, sz0), bz1c = std::min(oz + 15, sz1);
+     
+-    const int sxs = cam.x < ox + 8 ? -1 : 1, sys = cam.y < oy + 8 ? -1 : 1, szs = cam.z < oz + 8 ? -1 : 1;
++    const int sxs = sSxs, sys = sSys, szs = sSzs;
+     // Per-block tessellation. This span covers texBlock for every block in the chunk, which is where the
+     // engine's TessellateInWorld runs AND where texBlock validates the vertices it produced. The two are
+     // deliberately not timed apart: separating them needs a clock read per block, and at up to 16^3
+@@ -2008,8 +2098,13 @@
+     // validation OUTCOME is counted instead (HoloValidVerts / HoloBadVerts), so a validation problem is
+     // still visible even though its time is folded into this figure.
+     const uint64_t tessT0 = perf::on() ? monoUs() : 0;
+-    for (int ix = 0; ix <= bx1c - bx0c; ++ix)
+-      for (int iy = 0; iy <= by1c - by0c; ++iy)
++    // Slabs run outermost so the budget can be checked between them. Which axis is outermost does not
++    // change what geometry is produced, only the order it is produced in, so this is output-neutral.
++    bool partial = false;
++    for (int iy = sStartY; iy <= by1c - by0c; ++iy) {
++      const int blocksBefore = tf->blocks;
++      const uint32_t vertsBefore = tf->verts;
++      for (int ix = 0; ix <= bx1c - bx0c; ++ix)
+         for (int iz = 0; iz <= bz1c - bz0c; ++iz) {
+           const int wx = sxs < 0 ? bx1c - ix : bx0c + ix, wy = sys < 0 ? by1c - iy : by0c + iy,
+                     wz = szs < 0 ? bz1c - iz : bz0c + iz;
+@@ -2081,8 +2176,29 @@
+                                            : "door: broken geometry, thin-panel fallback")
+                                 : (nv == 0 ? "no geometry from BlockTessellator (block entity?)" : "broken geometry"));
+         }
++      // One slab done: charge it to the frame, then decide whether another slab fits. Consulting the
++      // budget here rather than after the whole chunk is what makes the bound enforceable - a slab is
++      // at most 16x16 blocks, so a frame can overshoot its ceiling by no more than one slab.
++      gSched.spend(uint32_t(tf->blocks - blocksBefore), tf->verts - vertsBefore,
++                   uint64_t((nowMs() - frameT0) * 1000.0), need);
++      if (canSpanFrames && iy < by1c - by0c && !gSched.mayWork(need, resuming)) {
++        sStartY = iy + 1;  // resume from the next slab
++        partial = true;
++        break;
++      }
++    }
+     if (tessT0) perf::count(perf::HoloTessUs, monoUs() - tessT0);
++    // Flushed before anything else: texCut turns whatever the tessellator holds into a complete mesh
++    // and clears it, so the engine never inherits Structura's half-filled vertices across a frame
++    // boundary. On a partial build this is what makes stopping here safe.
+     texCut(*tf);
++    if (partial) {
++      // Not finished. The staging vectors survive, the chunk stays in Building, and the mesh it was
++      // already drawing is untouched - so nothing partial is ever submitted and nothing disappears.
++      perf::countMax(perf::HoloBuildMaxUs, monoUs() - buildT0);
++      return;
++    }
++    sBuildActive = false;
+     tf->out = nullptr;
+     
+     if (tf->blocks > blocks0 && tf->verts == verts0) {
+@@ -2099,12 +2215,13 @@
+     cm.meshes.swap(fresh);
+     gMeshTotal += uint32_t(cm.meshes.size());
+     cm.culled = tf->cull;
+-    cm.bcx = cam.x; cm.bcy = cam.y; cm.bcz = cam.z;
++    // Recorded against the camera the build started at, matching the cull band baked into the mesh.
++    cm.bcx = sCcx + ox; cm.bcy = sCcy + oy; cm.bcz = sCcz + oz;
+     cm.special.swap(special);
+     cm.edges.swap(edges);
+-    cm.built = true;
+-    cm.dirty = false;
+-    cm.builtFrame = gFrame;
++    // Publish. Only a completed build reaches here, so the chunk never shows partial geometry, and
++    // the meshes it was drawing until now stayed drawable for the whole build.
++    holo::mesh::commit(cm.slot, gFrame);
+     if (meshT0) perf::count(perf::HoloMeshUs, monoUs() - meshT0);
+     // A rebuild (chunk was already built) is strictly more expensive than a first build, so the two are
+     // counted apart: a rising rebuild rate means churn, not growth.
+@@ -2125,14 +2242,25 @@
+       for (int c = ccz0; c <= ccz1; ++c) {
+         ChunkMeshes &cm = gChunks[chunkKey(a, b, c)];
+         cm.seenFrame = gFrame;
+-        if (cm.built && cm.culled && !cm.dirty) {
++        // A build left in flight for too long is presumed abandoned (context switch, structure swap).
++        // Releasing it lets the chunk be rebuilt instead of staying wedged; the published mesh, if any,
++        // survives, so this cannot blank the hologram.
++        if (holo::mesh::buildStalled(cm.slot, gFrame, kBuildStallFrames)) holo::mesh::abortBuild(cm.slot);
++        // Camera movement only ever makes a cached mesh stale, never wrong, so it is recorded as a
++        // View invalidation. That is the whole point of the split: the cached mesh was generated with
++        // a camera-dependent cull band, so faces beyond it were collapsed, and some may now be
++        // visible - but the chunk keeps drawing what it has, and the refresh competes only with other
++        // view work, never with a real world edit.
++        if (cm.slot.drawable() && cm.culled && cm.slot.invalid == holo::mesh::InvalidNone) {
+           const float cv[3] = {cam.x, cam.y, cam.z}, bv[3] = {cm.bcx, cm.bcy, cm.bcz};
+           const int o3[3] = {a * 16, b * 16, c * 16};
++          const holo::lod::ViewHysteresis vh{kCullRebuild, kCullBand};
+           for (int ax = 0; ax < 3; ++ax) {
+-            if (std::fabs(cv[ax] - bv[ax]) <= kCullRebuild) continue;
++            const float delta = std::fabs(cv[ax] - bv[ax]);
++            if (!holo::lod::viewStaleOnAxis(delta, vh)) continue;
+             const float lo = std::min(cv[ax], bv[ax]) - kCullBand - 1.f, hi = std::max(cv[ax], bv[ax]) + kCullBand + 1.f;
+             if (o3[ax] + 16 >= lo && o3[ax] <= hi) {
+-              cm.dirty = true;
++              holo::mesh::invalidate(cm.slot, holo::mesh::InvalidView);
+               perf::count(perf::InvCull);
+               break;
+             }
+@@ -2152,29 +2280,40 @@
+     debtMs = std::max(0.0, debtMs - 2.5);
+   } else {
+     int builds = 0;
++    gSched.beginFrame();
+     for (ChunkRef &c : chunks) {
+-      if (!c.cm->dirty) continue;
+-      
+-      if (c.cm->built && gFrame - c.cm->builtFrame < 20) continue;
+-      if (any && nowMs() - t0 > 2.5) break;
+-      if (builds >= kMaxBuildsPerFrame) break;
+-      if (c.cm->built && builds >= kMaxRebuildsPerFrame) break;   // 重建更贵，限得更死
+-      if (!c.cm->built && gMeshTotal >= kMaxMeshes) { gOut.capped = true; break; }
+-      buildChunk(c.x, c.y, c.z, *c.cm);
++      // `chunks` is already sorted near to far, so the budget is spent on the chunks the viewer is
++      // most likely to notice first.
++      const bool resuming = c.cm->slot.building;
++      const holo::lod::Need need = needOf(c.cm->slot);
++      if (!resuming && !holo::lod::needsWork(need)) continue;
++      // A chunk generated moments ago is left alone: it was built from state that is still current.
++      if (!resuming && c.cm->slot.drawable() && gFrame - c.cm->slot.readyFrame < 20) continue;
++      // Checked before taking the chunk on, and again between blocks inside the build, so an
++      // expensive chunk cannot overrun the frame the way the old whole-chunk check allowed.
++      if (gSched.stopReason(need, resuming) != holo::lod::Stop::None) break;
++      if (!c.cm->slot.drawable() && gMeshTotal >= kMaxMeshes) { gOut.capped = true; break; }
++      buildChunk(c.x, c.y, c.z, *c.cm, need, resuming, t0);
+       any = true;
+       ++builds;
++      if (gSched.exhausted()) break;
+     }
+     gOut.builds += uint32_t(builds);
+     perf::count(perf::HoloBuilds, uint64_t(builds));
++    gBuildStop = gSched.stopReason(holo::lod::Need::World, true);
+     debtMs = std::min(10.0, std::max(0.0, nowMs() - t0 - 2.5));
+   }
+   
+   if (!any && debtMs <= 0 && (gFrame % 30) == 0) {
+     ChunkRef *old = nullptr;
+     for (ChunkRef &c : chunks)
+-      if (c.cm->built && gFrame - c.cm->builtFrame > 600 && (!old || c.cm->builtFrame < old->cm->builtFrame)) old = &c;
++      if (c.cm->slot.drawable() && gFrame - c.cm->slot.readyFrame > 600 &&
++          (!old || c.cm->slot.readyFrame < old->cm->slot.readyFrame))
++        old = &c;
+     if (old) {
+-      buildChunk(old->x, old->y, old->z, *old->cm);
++      // The periodic refresh of the oldest chunk is view work: nothing in the world changed, it is
++      // only being regenerated so long-stale culling does not accumulate.
++      buildChunk(old->x, old->y, old->z, *old->cm, holo::lod::Need::View, old->cm->slot.building, t0);
+       any = true;
+     }
+   }
+@@ -2194,10 +2333,18 @@
+       colorChunk(c.x, c.y, c.z);
+       continue;
+     }
+-    if (!cm.built) {  
++    if (!cm.slot.drawable()) {  
+       ++pending;
+       continue;
+     }
++    // Wireframe backend: skip the cached meshes entirely and regenerate this chunk as immediate
++    // geometry, which is the same path the no-matrix fallback already uses. The cached meshes are left
++    // alone so switching back costs nothing.
++    if (gBackend.kind != holo::backend::Kind::Mesh) {
++      ++pending;
++      colorChunk(c.x, c.y, c.z);
++      continue;
++    }
+     ++ready;
+     const float tx = float(c.x * 16 - cam.x), ty = float(c.y * 16 - cam.y), tz = float(c.z * 16 - cam.z);
+     for (MeshBlob *m : cm.meshes) {
+@@ -2219,7 +2366,7 @@
+   if (cyanStyle && stack) {
+     const Rgba ec{cyan::kEdgeR, cyan::kEdgeG, cyan::kEdgeB, cyan::kEdgeA};
+     for (const ChunkRef &c : chunks) {
+-      if (!c.cm->built || c.cm->edges.empty()) continue;
++      if (!c.cm->slot.drawable() || c.cm->edges.empty()) continue;
+       if (gLines.size() >= kMaxLines || cyanLines >= kCyanLinesPerFrame) break;
+       const int ox = c.x * 16, oy = c.y * 16, oz = c.z * 16;
+       const size_t n = std::min({kMaxLines - gLines.size(), kCyanLinesPerFrame - cyanLines, c.cm->edges.size()});
+@@ -2243,7 +2390,7 @@
+   gOut.chunksTotal = uint32_t(chunks.size());
+   gOut.chunksBuilt = 0;
+   for (const ChunkRef &c : chunks)
+-    if (c.cm->built) ++gOut.chunksBuilt;
++    if (c.cm->slot.drawable()) ++gOut.chunksBuilt;
+   gOut.meshesDrawn = nMeshes;
+   st.texChunks.store(ready, std::memory_order_relaxed);
+   st.texBlocks.store(pending, std::memory_order_relaxed);
+@@ -2600,7 +2747,7 @@
+     if (seenStyle != s.holoStyle.load()) {   // 风格变了：旧网格（带剔除/半透明）必须重建
+       seenStyle = s.holoStyle.load();
+       for (auto &kv : gChunks) {
+-        kv.second.dirty = true;
++        holo::mesh::invalidate(kv.second.slot, holo::mesh::InvalidWorld);
+         perf::count(perf::InvStyle);
+       }
+     }
+diff -ruN a/src/render/HoloBackend.hpp b/src/render/HoloBackend.hpp
+--- a/src/render/HoloBackend.hpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/render/HoloBackend.hpp	2026-10-24 15:48:47.407146639 +0000
+@@ -0,0 +1,125 @@
++#pragma once
++// Render backend selection.
++//
++// Responsibility: choose how the hologram's geometry reaches the screen, from what is actually
++// available at runtime.
++//
++// Two backends exist and both are built on paths the source already exercised:
++//
++//   Mesh - the combined custom mesh path. Geometry is tessellated once per chunk into the engine's
++//          own mesh objects and submitted as whole meshes. This is the existing textured path, and it
++//          is the primary backend because a chunk's geometry is submitted in one call rather than one
++//          vertex at a time.
++//
++//   Wire - immediate lines and quads. Simpler, needs far less of the engine to be resolved, and
++//          already used for the cyan edge style. Kept as the fallback when the mesh pipeline is not
++//          available and as an explicit diagnostic mode, because when the hologram renders wrongly it
++//          is the fastest way to separate a geometry bug from a mesh-submission bug.
++//
++// Selection is capability-driven and never guesses. Every capability below corresponds to a function
++// pointer the resolver already fills in; nothing here assumes an API the source has not verified.
++
++#include <cstdint>
++
++namespace lm::holo::backend {
++
++enum class Kind : uint8_t {
++  // Combined custom mesh, submitted per chunk. Requires the full tessellation and mesh pipeline.
++  Mesh,
++  // Immediate lines and quads. Requires only the vertex submission entry point.
++  Wire,
++};
++
++inline const char *kindName(Kind k) { return k == Kind::Mesh ? "mesh" : "wire"; }
++
++// What the resolver managed to find. Each field mirrors a check the source already performs; the
++// grouping into a struct is what lets selection be tested instead of inferred.
++struct Capabilities {
++  // Vertex submission into a tessellator (sVertex) plus the tessellation entry point
++  // (sTessInWorld). Without these no geometry can be produced at all.
++  bool tessellate = false;
++  // Mesh object lifecycle: end tessellation into a mesh, render it, destroy it, and the matrix
++  // push/pop that positions it. This is what the Mesh backend needs beyond plain tessellation.
++  bool meshPipeline = false;
++  // Materials and the block registry lookups, i.e. the textured path specifically.
++  bool materials = false;
++  // Operator asked for wireframe, for diagnosis. Overrides capability-based choice.
++  bool forceWire = false;
++};
++
++// Why the chosen backend is what it is. Surfaced in the diagnostics line so a fallback is visible
++// rather than silent.
++enum class Reason : uint8_t {
++  None,              // the requested backend was available and is in use
++  Forced,            // wireframe was explicitly requested
++  NoTessellation,    // nothing can be drawn
++  NoMeshPipeline,    // mesh objects unavailable, fell back to immediate geometry
++  NoMaterials,       // textured materials unavailable, fell back to immediate geometry
++};
++
++inline const char *reasonName(Reason r) {
++  switch (r) {
++    case Reason::Forced: return "forced";
++    case Reason::NoTessellation: return "no-tessellation";
++    case Reason::NoMeshPipeline: return "no-mesh-pipeline";
++    case Reason::NoMaterials: return "no-materials";
++    case Reason::None: break;
++  }
++  return "none";
++}
++
++struct Decision {
++  Kind kind = Kind::Wire;
++  Reason reason = Reason::NoTessellation;
++  // True when nothing at all can be drawn. The caller must skip submission rather than pick a
++  // backend that would dereference an unresolved pointer.
++  bool viable() const { return reason != Reason::NoTessellation; }
++};
++
++// Choose a backend. `requested` is what the operator or the settings asked for; the result may be a
++// fallback when the request cannot be satisfied.
++//
++// The ordering of the checks matters: tessellation is checked first because without it neither
++// backend works, and an explicit wireframe request is honoured before the mesh pipeline is examined,
++// so the diagnostic mode stays usable precisely when the mesh path is what is broken.
++inline Decision decide(const Capabilities &c, Kind requested) {
++  if (!c.tessellate) return {Kind::Wire, Reason::NoTessellation};
++  if (c.forceWire || requested == Kind::Wire) {
++    return {Kind::Wire, c.forceWire ? Reason::Forced : Reason::None};
++  }
++  if (!c.meshPipeline) return {Kind::Wire, Reason::NoMeshPipeline};
++  if (!c.materials) return {Kind::Wire, Reason::NoMaterials};
++  return {Kind::Mesh, Reason::None};
++}
++
++// Per-frame submission accounting shared by both backends. The caps are the ones the source already
++// enforced; putting them in one place means the two backends cannot drift apart.
++struct SubmitLimits {
++  uint32_t maxQuads = 40000;
++  uint32_t maxLines = 60000;
++  // Batch sizes used when flushing immediate geometry, so one flush is one draw call rather than one
++  // call per vertex.
++  uint32_t quadBatch = 512;
++  uint32_t lineBatch = 1024;
++  // Cyan grid lines per frame. Immediate line meshes are expensive enough that this is capped well
++  // below maxLines, and spent near to far so it is the distant lines that get dropped.
++  uint32_t cyanLinesPerFrame = 4096;
++};
++
++struct SubmitBudget {
++  uint32_t quads = 0, lines = 0, cyanLines = 0;
++
++  void reset() { quads = lines = cyanLines = 0; }
++  bool quadRoom(const SubmitLimits &l) const { return quads < l.maxQuads; }
++  bool lineRoom(const SubmitLimits &l) const { return lines < l.maxLines; }
++
++  // How many cyan lines may still be emitted this frame. Takes the smaller of the two remaining
++  // allowances, which is the rule the source applied inline at each of its three call sites.
++  uint32_t cyanRoom(const SubmitLimits &l) const {
++    const uint32_t byTotal = l.maxLines > lines ? l.maxLines - lines : 0;
++    const uint32_t byCyan = l.cyanLinesPerFrame > cyanLines ? l.cyanLinesPerFrame - cyanLines : 0;
++    return byTotal < byCyan ? byTotal : byCyan;
++  }
++};
++
++}  // namespace lm::holo::backend
+diff -ruN a/src/render/HoloGeometry.hpp b/src/render/HoloGeometry.hpp
+--- a/src/render/HoloGeometry.hpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/render/HoloGeometry.hpp	2026-10-24 15:48:47.407146639 +0000
+@@ -0,0 +1,167 @@
++#pragma once
++// Hologram geometry generation.
++//
++// Responsibility: turn a chunk of structure blocks into renderable geometry, in resumable pieces.
++//
++// This component is deliberately engine-free. It owns the *bookkeeping* of geometry generation -
++// the neighbour window addressing, the exposure test, the resumable build cursor and the
++// vertex/block accounting - so that all of it can be exercised on the host without libminecraftpe
++// or the Android NDK. The calls that actually produce vertices (TessellateInWorld and friends)
++// stay in Hologram.cpp behind the resolved function pointers; this file only decides *which* block
++// to work on next and *when to stop*.
++//
++// Why a cursor exists: a chunk build used to be one indivisible unit of work. The per-frame guard
++// was checked only between whole chunks, so the cost of a single chunk - a 20^3 window fill plus up
++// to 16^3 tessellation calls - was unbounded. The cursor splits the tessellation phase into
++// single-block steps so the caller can stop between any two of them and resume next frame.
++
++#include <cstddef>
++#include <cstdint>
++
++namespace lm::holo::geo {
++
++// Neighbour window: a chunk is 16^3, and the exposure test reads two blocks beyond each face, so
++// the window is 20^3. Mirrors kWin in Hologram.cpp; the static_assert there pins the two together.
++constexpr int kWin = 20;
++constexpr int kWinRadius = 2;
++constexpr size_t kWinCells = size_t(kWin) * kWin * kWin;
++
++// The six face neighbours, in the same order Hologram.cpp uses for its shading table.
++constexpr int kFaceCount = 6;
++constexpr int kFaceDelta[kFaceCount][3] = {{0, 1, 0}, {0, -1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}};
++
++// Window index of a world position, relative to the chunk origin. Returns false when the position
++// falls outside the window, which happens for blocks further than kWinRadius from the chunk.
++inline bool windowIndex(int wx, int wy, int wz, int ox, int oy, int oz, size_t &out) {
++  const int lx = wx - ox + kWinRadius, ly = wy - oy + kWinRadius, lz = wz - oz + kWinRadius;
++  if (unsigned(lx) >= unsigned(kWin) || unsigned(ly) >= unsigned(kWin) || unsigned(lz) >= unsigned(kWin)) return false;
++  out = (size_t(lx) * kWin + size_t(ly)) * kWin + size_t(lz);
++  return true;
++}
++
++// Index of the `f`-th neighbour of a window cell. Returns false when the neighbour leaves the
++// window; callers treat that as "not occluding", i.e. the face is exposed.
++inline bool neighbourIndex(size_t cell, int f, size_t &out) {
++  if (f < 0 || f >= kFaceCount || cell >= kWinCells) return false;
++  const size_t z = cell % kWin, y = (cell / kWin) % kWin, x = cell / (size_t(kWin) * kWin);
++  const int nx = int(x) + kFaceDelta[f][0], ny = int(y) + kFaceDelta[f][1], nz = int(z) + kFaceDelta[f][2];
++  if (nx < 0 || ny < 0 || nz < 0 || nx >= kWin || ny >= kWin || nz >= kWin) return false;
++  out = (size_t(nx) * kWin + size_t(ny)) * kWin + size_t(nz);
++  return true;
++}
++
++// Exposure test: a block face is worth tessellating when at least one neighbour is absent or does
++// not occlude. `occupied[c]` is non-zero when the window holds a hologram block at cell c, and
++// `occludes[c]` is non-zero when that block hides the faces behind it. This is the same predicate
++// Hologram.cpp applies; keeping it here means the rule has one definition and one test.
++//
++// A neighbour outside the window counts as exposed: the window only extends two blocks past the
++// chunk, and a chunk boundary must not suppress faces that are genuinely visible.
++inline bool isExposed(size_t cell, const uint8_t *occupied, const uint8_t *occludes) {
++  if (cell >= kWinCells) return false;
++  for (int f = 0; f < kFaceCount; ++f) {
++    size_t ni = 0;
++    if (!neighbourIndex(cell, f, ni)) return true;
++    if (!occupied[ni] || !occludes[ni]) return true;
++  }
++  return false;
++}
++
++// Per-frame ceiling on geometry production. These bound the *amount* of work, which is what the
++// old 2.5 ms post-hoc guard could not do: that guard limited how many chunks were started, never
++// how much a single chunk cost.
++struct GeometryLimits {
++  uint32_t blocks = 384;    // blocks whose geometry may be produced in one frame
++  uint32_t verts = 16384;   // vertices that may be produced in one frame
++};
++
++// Running tally against GeometryLimits.
++struct GeometryBudget {
++  uint32_t blocks = 0;
++  uint32_t verts = 0;
++
++  void reset() { blocks = 0; verts = 0; }
++  bool exhausted(const GeometryLimits &l) const { return blocks >= l.blocks || verts >= l.verts; }
++  uint32_t blocksLeft(const GeometryLimits &l) const { return l.blocks > blocks ? l.blocks - blocks : 0; }
++  uint32_t vertsLeft(const GeometryLimits &l) const { return l.verts > verts ? l.verts - verts : 0; }
++  void addBlocks(uint32_t n) { blocks += n; }
++  void addVerts(uint32_t n) { verts += n; }
++};
++
++// Resumable position inside one chunk build.
++//
++// Phases:
++//   Window     - fill the 20^3 neighbour window. Fixed cost, not resumable: the exposure test needs
++//                the whole window before any face can be classified.
++//   Tessellate - walk the chunk's blocks producing geometry. Resumable at single-block granularity.
++//   Commit     - the geometry is complete and may be published.
++//   Finished   - nothing left to do.
++//
++// A cursor never reports Commit until every block has been visited, which is what makes it safe to
++// publish: a build that ran out of budget stays in Tessellate and its partial geometry is never
++// handed to the renderer.
++struct BuildCursor {
++  enum class Phase : uint8_t { Window, Tessellate, Commit, Finished };
++
++  Phase phase = Phase::Window;
++  int ix = 0, iy = 0, iz = 0;  // position inside the tessellation loop
++  int nx = 0, ny = 0, nz = 0;  // extents of that loop
++  uint32_t blocksDone = 0;
++  uint32_t vertsDone = 0;
++
++  // Start a fresh build over an nx * ny * nz block range.
++  void start(int extentX, int extentY, int extentZ) {
++    phase = Phase::Window;
++    ix = iy = iz = 0;
++    nx = extentX;
++    ny = extentY;
++    nz = extentZ;
++    blocksDone = 0;
++    vertsDone = 0;
++  }
++
++  bool inFlight() const { return phase == Phase::Window || phase == Phase::Tessellate; }
++  bool finished() const { return phase == Phase::Finished; }
++  // True only when the whole chunk has been visited and the geometry may be published.
++  bool readyToCommit() const { return phase == Phase::Commit; }
++
++  // Called once the window fill is done; enters the tessellation phase.
++  void beginTessellate() {
++    if (phase == Phase::Window) phase = (nx > 0 && ny > 0 && nz > 0) ? Phase::Tessellate : Phase::Commit;
++  }
++
++  // Advance to the next block in the caller's iteration order (z fastest, then y, then x).
++  // Returns false when there is no next block, leaving the cursor in Commit.
++  bool next() {
++    if (phase != Phase::Tessellate) return false;
++    if (++iz >= nz) {
++      iz = 0;
++      if (++iy >= ny) {
++        iy = 0;
++        if (++ix >= nx) {
++          phase = Phase::Commit;
++          return false;
++        }
++      }
++    }
++    return true;
++  }
++
++  // Total blocks the tessellation phase will visit. Used to size budgets before starting.
++  uint32_t totalBlocks() const {
++    if (nx <= 0 || ny <= 0 || nz <= 0) return 0;
++    return uint32_t(nx) * uint32_t(ny) * uint32_t(nz);
++  }
++
++  // How far through the tessellation phase this cursor is, in blocks. Lets the caller report
++  // progress for a build that spans many frames.
++  uint32_t blocksVisited() const {
++    if (phase == Phase::Window) return 0;
++    if (phase == Phase::Commit || phase == Phase::Finished) return totalBlocks();
++    return uint32_t((size_t(ix) * ny + size_t(iy)) * size_t(nz) + size_t(iz));
++  }
++
++  void markFinished() { phase = Phase::Finished; }
++};
++
++}  // namespace lm::holo::geo
+diff -ruN a/src/render/HoloLod.hpp b/src/render/HoloLod.hpp
+--- a/src/render/HoloLod.hpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/render/HoloLod.hpp	2026-10-24 15:48:47.407146639 +0000
+@@ -0,0 +1,193 @@
++#pragma once
++// Distance-based visibility and per-frame workload policy.
++//
++// Responsibility: decide how much hologram work one frame may do, and in what order.
++//
++// This replaces a time budget that was checked in the wrong place. The previous guard asked "has
++// 2.5 ms elapsed?" only *between* whole chunk builds, so it bounded the number of chunks started per
++// frame but never the cost of any single one. A chunk whose build ran long blew straight through the
++// budget, and the guard could only notice afterwards.
++//
++// The policy here is expressed in *work units* - blocks visited, vertices produced - which the caller
++// checks between individual blocks. A unit budget is enforceable mid-build; a wall-clock budget is
++// only ever advisory, so it is kept as a secondary signal rather than the primary bound.
++
++#include <cstdint>
++
++namespace lm::holo::lod {
++
++// What a chunk needs, in priority order.
++//
++//   First  - never built. The hologram is incomplete without it.
++//   World  - the world changed under it. The drawn geometry is wrong.
++//   View   - only the camera moved. The drawn geometry is stale but whole.
++//
++// View work is deliberately the lowest priority and the tightest capped: it is the one category that
++// a moving camera generates without limit, and it is also the one the viewer is least likely to
++// notice, because the stale mesh differs from the correct one only in faces near the cull band.
++enum class Need : uint8_t { None, View, World, First };
++
++inline bool needsWork(Need n) { return n != Need::None; }
++inline bool operator>(Need a, Need b) { return unsigned(a) > unsigned(b); }
++
++// Per-frame ceilings.
++struct Limits {
++  // Blocks whose geometry may be produced this frame, across every chunk. This is the bound that
++  // actually holds: it is checked between blocks, so a single expensive chunk cannot exceed it by
++  // more than one block's worth of work.
++  uint32_t blocks = 384;
++  // Vertices produced this frame. Guards against a few dense blocks producing a huge mesh.
++  uint32_t verts = 16384;
++  // Chunks whose build may be *started* this frame. Starting a build allocates staging, so this is
++  // kept small; resuming an existing build is cheaper and is not limited by it.
++  uint32_t starts = 1;
++  // Chunks whose build may be *resumed* this frame.
++  uint32_t resumes = 1;
++  // Of the blocks allowed, at most this many may go to view-only staleness.
++  uint32_t viewBlocks = 96;
++  // Wall-clock advisory, in microseconds. Secondary to the unit budgets; used only to stop early
++  // when a block turns out to be far more expensive than average.
++  uint64_t us = 1500;
++};
++
++// Running accounting for one frame.
++struct Frame {
++  uint32_t blocks = 0, verts = 0, starts = 0, resumes = 0, viewBlocks = 0;
++  uint64_t us = 0;
++
++  void reset() {
++    blocks = verts = starts = resumes = viewBlocks = 0;
++    us = 0;
++  }
++};
++
++// Why the scheduler would refuse more work. Reported so the diagnostics line can say which ceiling
++// was hit instead of leaving it to inference.
++enum class Stop : uint8_t { None, Blocks, Verts, ViewBlocks, Starts, Resumes, Time };
++
++inline const char *stopName(Stop s) {
++  switch (s) {
++    case Stop::Blocks: return "blocks";
++    case Stop::Verts: return "verts";
++    case Stop::ViewBlocks: return "view-blocks";
++    case Stop::Starts: return "starts";
++    case Stop::Resumes: return "resumes";
++    case Stop::Time: return "time";
++    case Stop::None: break;
++  }
++  return "none";
++}
++
++class Scheduler {
++ public:
++  explicit Scheduler(const Limits &l = {}) : lim(l) {}
++
++  // Call once per frame before any build work.
++  void beginFrame() { f.reset(); }
++
++  const Limits &limits() const { return lim; }
++  void setLimits(const Limits &l) { lim = l; }
++  const Frame &frame() const { return f; }
++
++  // May this frame take on another block of geometry for a chunk with the given need?
++  // `resuming` distinguishes continuing an in-flight build from starting a new one, because the two
++  // draw on different allowances.
++  bool mayWork(Need need, bool resuming) const { return stopReason(need, resuming) == Stop::None; }
++
++  // The ceiling that would be hit, or Stop::None when more work is allowed. Checked by the caller
++  // *between blocks*, which is what makes the bound real.
++  Stop stopReason(Need need, bool resuming) const {
++    if (f.blocks >= lim.blocks) return Stop::Blocks;
++    if (f.verts >= lim.verts) return Stop::Verts;
++    if (f.us >= lim.us) return Stop::Time;
++    if (need == Need::View && f.viewBlocks >= lim.viewBlocks) return Stop::ViewBlocks;
++    if (resuming) {
++      if (f.resumes >= lim.resumes) return Stop::Resumes;
++    } else {
++      if (f.starts >= lim.starts) return Stop::Starts;
++    }
++    return Stop::None;
++  }
++
++  // Record work actually done. The caller measures `us` itself; the unit counts are exact.
++  void spend(uint32_t blocks, uint32_t verts, uint64_t us, Need need) {
++    f.blocks += blocks;
++    f.verts += verts;
++    f.us += us;
++    if (need == Need::View) f.viewBlocks += blocks;
++  }
++
++  // Record that a chunk build was taken on this frame.
++  void noteTakenOn(bool resuming) { resuming ? ++f.resumes : ++f.starts; }
++
++  // Blocks still available to a chunk with the given need this frame.
++  uint32_t blocksLeft(Need need) const {
++    uint32_t left = lim.blocks > f.blocks ? lim.blocks - f.blocks : 0;
++    if (need == Need::View) {
++      const uint32_t vl = lim.viewBlocks > f.viewBlocks ? lim.viewBlocks - f.viewBlocks : 0;
++      if (vl < left) left = vl;
++    }
++    return left;
++  }
++  uint32_t vertsLeft() const { return lim.verts > f.verts ? lim.verts - f.verts : 0; }
++
++  // True when any ceiling has been reached, i.e. the frame should stop taking on build work.
++  bool exhausted() const {
++    return f.blocks >= lim.blocks || f.verts >= lim.verts || f.us >= lim.us;
++  }
++
++ private:
++  Limits lim;
++  Frame f;
++};
++
++// Visibility by distance. Chunks are already collected into a range box and sorted near to far by
++// Hologram.cpp; this only classifies them, so the ordering and the caps stay where they are.
++//
++// The point of separating this from geometry is that a visibility change must not invalidate a mesh.
++// A chunk that moves out of range stops being drawn and keeps its mesh; a chunk that moves back in
++// range draws the mesh it already has. Neither is a geometry change, and neither should trigger a
++// rebuild.
++enum class Vis : uint8_t { Hidden, Deferred, Visible };
++
++struct VisPolicy {
++  // Squared distances, matching the squared-distance comparison the chunk sort already uses.
++  float visibleSq = 96.f * 96.f;
++  // Beyond this a chunk is not drawn at all rather than drawn late.
++  float hiddenSq = 160.f * 160.f;
++};
++
++inline Vis classify(float distSq, const VisPolicy &p) {
++  if (distSq <= p.visibleSq) return Vis::Visible;
++  if (distSq <= p.hiddenSq) return Vis::Deferred;
++  return Vis::Hidden;
++}
++
++// A chunk counts as "moved far enough to matter" only past this distance. Hysteresis on top of the
++// cull band: without it a camera hovering near the threshold re-dirties the same chunks every frame.
++struct ViewHysteresis {
++  float rebuild = 8.f;  // must move at least this far before a view rebuild is considered
++  float band = 10.f;    // the cull band the cached mesh was generated with
++};
++
++// The movement half of the staleness question: has the camera moved far enough on one axis that a
++// chunk built at the old position may now show faces its cached culling collapsed?
++//
++// This deliberately does *not* decide staleness on its own. The caller must still confirm the chunk
++// lies inside the band swept between the build position and the camera, which is the position test
++// Hologram.cpp already performs using ViewHysteresis::band. Splitting the two keeps the movement
++// threshold here, where it can be tested, and the geometry-dependent span test where the geometry is.
++inline bool viewStaleOnAxis(float delta, const ViewHysteresis &h) { return delta > h.rebuild; }
++
++// True when the chunk is far enough from both the camera and its build position that no face of it
++// can have entered the cull band. Such a chunk is stale in name only and does not need a rebuild.
++// `delta` is the per-axis camera movement; `chunkDistance` is how far the chunk sits from the camera
++// on the same axis.
++inline bool viewStalenessMatters(float delta, float chunkDistance, const ViewHysteresis &h) {
++  if (!viewStaleOnAxis(delta, h)) return false;
++  // A face becomes newly visible only if it is now within `band` of the camera. A chunk further than
++  // band + its own 16-block extent cannot have such a face.
++  return chunkDistance <= h.band + 16.f;
++}
++
++}  // namespace lm::holo::lod
+diff -ruN a/src/render/HoloMeshState.hpp b/src/render/HoloMeshState.hpp
+--- a/src/render/HoloMeshState.hpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/render/HoloMeshState.hpp	2026-10-24 15:48:47.407146639 +0000
+@@ -0,0 +1,114 @@
++#pragma once
++// Cached hologram mesh storage and invalidation.
++//
++// Responsibility: hold each chunk's generated mesh, decide when it is safe to draw, and record why
++// it needs regenerating.
++//
++// The central invariant is that a chunk's *published* mesh set and its *in-flight* build are two
++// separate things. While a replacement is being generated the previously published mesh stays
++// drawable, and a build that has not finished is never published. That gives two properties the
++// renderer needs: the hologram never flickers to nothing while a chunk regenerates, and a partially
++// generated mesh can never be submitted as though it were complete.
++//
++// The state is a plain struct so it can live inside the existing ChunkMeshes in Hologram.cpp - one
++// source of truth, no parallel bookkeeping - while the transitions live here, where they can be
++// tested without the engine.
++
++#include <cstdint>
++
++namespace lm::holo::mesh {
++
++// Why a chunk's mesh needs regenerating. The distinction is what stops camera movement from being
++// treated as a world edit.
++//
++//   World - the structure, the comparison result or a recent placement changed. The geometry is
++//           genuinely wrong and must be rebuilt at full priority.
++//   View  - only the camera moved. The cached mesh was generated with a camera-dependent cull band
++//           (faces beyond it are collapsed to degenerate quads), so some faces that were culled may
++//           now be visible. The geometry is *stale*, not wrong, and rebuilding it is deferrable.
++//
++// Folding these together is what made walking past a build expensive: every chunk the camera passed
++// re-dirtied itself as though the world had changed, and competed for the same tiny rebuild budget
++// as real edits.
++enum Invalid : uint8_t { InvalidNone = 0, InvalidWorld = 1, InvalidView = 2 };
++
++// Lifecycle of one chunk's mesh set. Embedded in ChunkMeshes.
++struct SlotState {
++  // A complete mesh set is installed and may be drawn this frame.
++  bool hasPublished = false;
++  // A build is in flight. Its geometry is accumulating in staging, not in the published set.
++  bool building = false;
++  // Pending invalidation, a mask of Invalid.
++  uint8_t invalid = InvalidNone;
++  // Frame the published set was committed on. Drives the freshness checks Hologram.cpp already had.
++  uint32_t readyFrame = 0;
++  // Frame the in-flight build started on. Lets the caller abandon a build that is taking too long.
++  uint32_t buildStart = 0;
++
++  // Drawable right now, regardless of any pending invalidation. A stale mesh that is still whole is
++  // always better than no mesh.
++  bool drawable() const { return hasPublished; }
++  // Needs a rebuild: something changed, and no build is already covering it.
++  bool needsRebuild() const { return invalid != InvalidNone && !building; }
++  // The only pending invalidation is camera movement.
++  bool viewOnly() const { return invalid == InvalidView; }
++  bool hasWorldInvalidation() const { return (invalid & InvalidWorld) != 0; }
++};
++
++// Start a build. The published set is deliberately untouched, so the chunk keeps drawing whatever it
++// had. Returns false when a build is already in flight, so the caller cannot start a second one and
++// orphan the first one's staging.
++inline bool beginBuild(SlotState &s, uint32_t frame) {
++  if (s.building) return false;
++  s.building = true;
++  s.buildStart = frame;
++  return true;
++}
++
++// Publish the staging set. Only legal from a build in flight; publishing without one would mean
++// handing the renderer geometry nobody generated.
++//
++// Clearing the whole invalidation mask on commit is intentional and slightly conservative: the
++// build ran against the state current when it finished, so anything recorded before that point is
++// covered. An invalidation arriving *after* the build started is re-raised by the caller's watcher
++// on a later frame.
++inline bool commit(SlotState &s, uint32_t frame) {
++  if (!s.building) return false;
++  s.building = false;
++  s.hasPublished = true;
++  s.invalid = InvalidNone;
++  s.readyFrame = frame;
++  return true;
++}
++
++// Discard the staging set without publishing. The published set survives untouched, which is the
++// difference between abandoning a build and losing a chunk's geometry.
++inline void abortBuild(SlotState &s) {
++  s.building = false;
++  // Whatever caused this build is still unaddressed.
++  s.invalid = uint8_t(unsigned(s.invalid) | unsigned(InvalidWorld));
++}
++
++// Record that the mesh is out of date. Never clears hasPublished: invalidating a chunk must not make
++// it stop drawing.
++inline void invalidate(SlotState &s, uint8_t mask) { s.invalid = uint8_t(unsigned(s.invalid) | unsigned(mask)); }
++
++// Clear part of the mask, used when a caller handles view staleness without a full rebuild.
++inline void clearInvalid(SlotState &s, uint8_t mask) { s.invalid &= uint8_t(~unsigned(mask)); }
++
++// Drop the published set entirely. Used when the cached meshes belong to a dead EGL context: the
++// handles are unusable, so keeping them drawable would submit stale GPU objects.
++inline void discardPublished(SlotState &s) {
++  s.hasPublished = false;
++  s.building = false;
++  s.invalid = uint8_t(unsigned(s.invalid) | unsigned(InvalidWorld));
++}
++
++// A build that has been in flight for longer than maxFrames is presumed stuck. Abandoning it frees
++// the chunk to be rebuilt; without this a build interrupted by a context switch would block that
++// chunk forever.
++inline bool buildStalled(const SlotState &s, uint32_t frame, uint32_t maxFrames) {
++  return s.building && frame - s.buildStart >= maxFrames;
++}
++
++}  // namespace lm::holo::mesh
+diff -ruN a/tests/render/backend_test.cpp b/tests/render/backend_test.cpp
+--- a/tests/render/backend_test.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/render/backend_test.cpp	2026-10-24 15:55:18.598330072 +0000
+@@ -0,0 +1,187 @@
++// Phase 1 tests: render backend selection (host, ASan+UBSan).
++//
++// Covers render/HoloBackend.hpp. Selection is capability-driven, so the risk these tests guard
++// against is a fallback that happens silently, or worse, a backend chosen when the function pointers
++// it needs were never resolved. Both would show up on a device as a crash or a blank hologram and be
++// hard to attribute.
++//
++// The explicit wireframe request is checked before the mesh pipeline so the diagnostic mode stays
++// usable exactly when the mesh path is the thing that is broken.
++#include <cstdio>
++#include <string>
++
++#include "render/HoloBackend.hpp"
++
++namespace {
++int gFails = 0, gPass = 0;
++#define CHECK(c)                                                                        \
++  do {                                                                                  \
++    if (c) ++gPass;                                                                     \
++    else { ++gFails; std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } \
++  } while (0)
++
++using namespace lm::holo::backend;
++
++Capabilities full() {
++  Capabilities c;
++  c.tessellate = true;
++  c.meshPipeline = true;
++  c.materials = true;
++  return c;
++}
++
++void testFullCapabilitiesGiveTheMeshBackend() {
++  const Decision d = decide(full(), Kind::Mesh);
++  CHECK(d.kind == Kind::Mesh);
++  CHECK(d.reason == Reason::None);
++  CHECK(d.viable());
++}
++
++void testMissingTessellationIsNotViable() {
++  // Nothing can be drawn: both backends need vertex submission. The caller must skip rather than
++  // pick one and dereference an unresolved pointer.
++  Capabilities c = full();
++  c.tessellate = false;
++  const Decision d = decide(c, Kind::Mesh);
++  CHECK(!d.viable());
++  CHECK(d.reason == Reason::NoTessellation);
++
++  // Asking for wireframe does not help; the missing piece is below both backends.
++  CHECK(!decide(c, Kind::Wire).viable());
++  // Nor does forcing it.
++  c.forceWire = true;
++  CHECK(!decide(c, Kind::Mesh).viable());
++}
++
++void testMissingMeshPipelineFallsBackToWire() {
++  Capabilities c = full();
++  c.meshPipeline = false;
++  const Decision d = decide(c, Kind::Mesh);
++  CHECK(d.kind == Kind::Wire);
++  CHECK(d.reason == Reason::NoMeshPipeline);
++  CHECK(d.viable());
++}
++
++void testMissingMaterialsFallsBackToWire() {
++  Capabilities c = full();
++  c.materials = false;
++  const Decision d = decide(c, Kind::Mesh);
++  CHECK(d.kind == Kind::Wire);
++  CHECK(d.reason == Reason::NoMaterials);
++  CHECK(d.viable());
++}
++
++void testWireframeRequestIsHonouredWithoutBeingAFallback() {
++  const Decision d = decide(full(), Kind::Wire);
++  CHECK(d.kind == Kind::Wire);
++  // Requested, not forced down: the diagnostics should not report a problem that does not exist.
++  CHECK(d.reason == Reason::None);
++  CHECK(d.viable());
++}
++
++void testForcedWireframeOverridesAvailability() {
++  Capabilities c = full();
++  c.forceWire = true;
++  const Decision d = decide(c, Kind::Mesh);
++  CHECK(d.kind == Kind::Wire);
++  CHECK(d.reason == Reason::Forced);
++
++  // Forcing wins even when the mesh path would have been chosen, which is the point of a diagnostic
++  // mode: it must be reachable while everything is resolving correctly.
++  CHECK(decide(c, Kind::Mesh).reason == Reason::Forced);
++  CHECK(decide(c, Kind::Wire).reason == Reason::Forced);
++}
++
++void testForceWireBeatsTheMeshPipelineCheck() {
++  // Diagnostic mode must stay usable when the mesh pipeline is exactly what failed to resolve.
++  Capabilities c = full();
++  c.meshPipeline = false;
++  c.forceWire = true;
++  const Decision d = decide(c, Kind::Mesh);
++  CHECK(d.kind == Kind::Wire);
++  CHECK(d.reason == Reason::Forced);
++  CHECK(d.viable());
++}
++
++void testReasonNamesAreStable() {
++  CHECK(std::string(reasonName(Reason::None)) == "none");
++  CHECK(std::string(reasonName(Reason::Forced)) == "forced");
++  CHECK(std::string(reasonName(Reason::NoTessellation)) == "no-tessellation");
++  CHECK(std::string(reasonName(Reason::NoMeshPipeline)) == "no-mesh-pipeline");
++  CHECK(std::string(reasonName(Reason::NoMaterials)) == "no-materials");
++  CHECK(std::string(kindName(Kind::Mesh)) == "mesh");
++  CHECK(std::string(kindName(Kind::Wire)) == "wire");
++}
++
++void testSubmitBudgetRespectsBothLineAllowances() {
++  SubmitLimits l;
++  l.maxLines = 60000;
++  l.cyanLinesPerFrame = 4096;
++  SubmitBudget b;
++
++  CHECK(b.lineRoom(l));
++  CHECK(b.quadRoom(l));
++  CHECK(b.cyanRoom(l) == 4096);
++
++  // The cyan allowance is the binding one long before the global line cap.
++  b.lines = 4000;
++  b.cyanLines = 4000;
++  CHECK(b.cyanRoom(l) == 96);
++  CHECK(b.lineRoom(l));
++
++  b.cyanLines = 4096;
++  CHECK(b.cyanRoom(l) == 0);
++  // The global cap still has room, which is why the two are tracked apart.
++  CHECK(b.lineRoom(l));
++  CHECK(b.cyanRoom(l) == 0);
++}
++
++void testSubmitBudgetClampsInsteadOfWrapping() {
++  SubmitLimits l;
++  l.maxQuads = 10;
++  l.maxLines = 10;
++  l.cyanLinesPerFrame = 10;
++  SubmitBudget b;
++  b.quads = 10;
++  b.lines = 10;
++  b.cyanLines = 10;
++  CHECK(!b.quadRoom(l));
++  CHECK(!b.lineRoom(l));
++  CHECK(b.cyanRoom(l) == 0);
++
++  // Overshoot must clamp to zero, not wrap unsigned into a huge allowance.
++  b.lines = 1000;
++  b.cyanLines = 0;
++  CHECK(b.cyanRoom(l) == 0);
++  CHECK(!b.lineRoom(l));
++}
++
++void testSubmitBudgetReset() {
++  SubmitLimits l;
++  SubmitBudget b;
++  b.quads = 5;
++  b.lines = 7;
++  b.cyanLines = 9;
++  b.reset();
++  CHECK(b.quads == 0);
++  CHECK(b.lines == 0);
++  CHECK(b.cyanLines == 0);
++  CHECK(b.cyanRoom(l) == l.cyanLinesPerFrame);
++}
++}  // namespace
++
++int main() {
++  testFullCapabilitiesGiveTheMeshBackend();
++  testMissingTessellationIsNotViable();
++  testMissingMeshPipelineFallsBackToWire();
++  testMissingMaterialsFallsBackToWire();
++  testWireframeRequestIsHonouredWithoutBeingAFallback();
++  testForcedWireframeOverridesAvailability();
++  testForceWireBeatsTheMeshPipelineCheck();
++  testReasonNamesAreStable();
++  testSubmitBudgetRespectsBothLineAllowances();
++  testSubmitBudgetClampsInsteadOfWrapping();
++  testSubmitBudgetReset();
++  std::printf("backend: %d passed, %d failed\n", gPass, gFails);
++  return gFails ? 1 : 0;
++}
+diff -ruN a/tests/render/geometry_test.cpp b/tests/render/geometry_test.cpp
+--- a/tests/render/geometry_test.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/render/geometry_test.cpp	2026-10-24 15:55:18.598330072 +0000
+@@ -0,0 +1,259 @@
++// Phase 1 tests: hologram geometry generation (host, ASan+UBSan).
++//
++// Covers render/HoloGeometry.hpp - the neighbour window addressing, the exposure test, the resumable
++// build cursor and the geometry budget. None of this touches the engine, which is the point: the
++// bookkeeping that decides what to build next and when to stop is now testable without a device.
++//
++// The invariant that matters most is the last group: a BuildCursor must not report readyToCommit
++// until every block has been visited. That is what stops a build which ran out of budget from being
++// published as though it were complete.
++#include <cstdio>
++#include <cstring>
++
++#include "render/HoloGeometry.hpp"
++
++namespace {
++int gFails = 0, gPass = 0;
++#define CHECK(c)                                                                        \
++  do {                                                                                  \
++    if (c) ++gPass;                                                                     \
++    else { ++gFails; std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } \
++  } while (0)
++
++using namespace lm::holo::geo;
++
++void testWindowIndexMatchesHologramFormula() {
++  // The window is the chunk expanded by kWinRadius on every side, so the chunk origin maps to
++  // (2,2,2) and the formula must agree with the inline one in Hologram.cpp.
++  size_t i = 999;
++  CHECK(windowIndex(0, 0, 0, 0, 0, 0, i));
++  CHECK(i == (size_t(2) * kWin + 2) * kWin + 2);
++
++  CHECK(windowIndex(16, 16, 16, 0, 0, 0, i));
++  CHECK(i == (size_t(18) * kWin + 18) * kWin + 18);
++
++  // A non-zero chunk origin is relative, not absolute.
++  CHECK(windowIndex(32, 0, 0, 32, 0, 0, i));
++  CHECK(i == (size_t(2) * kWin + 2) * kWin + 2);
++
++  // Two blocks past the chunk is still inside; three is not.
++  CHECK(windowIndex(-2, 0, 0, 0, 0, 0, i));
++  CHECK(i == (size_t(0) * kWin + 2) * kWin + 2);
++  CHECK(!windowIndex(-3, 0, 0, 0, 0, 0, i));
++  CHECK(!windowIndex(18, 0, 0, 0, 0, 0, i));
++  CHECK(windowIndex(17, 0, 0, 0, 0, 0, i));
++}
++
++void testNeighbourIndexStaysInsideWindow() {
++  size_t centre = 0;
++  CHECK(windowIndex(8, 8, 8, 0, 0, 0, centre));
++
++  // Every face neighbour of an interior cell exists, and round-trips back to the expected position.
++  for (int f = 0; f < kFaceCount; ++f) {
++    size_t n = 0;
++    CHECK(neighbourIndex(centre, f, n));
++    const int ex = 8 + kFaceDelta[f][0], ey = 8 + kFaceDelta[f][1], ez = 8 + kFaceDelta[f][2];
++    size_t want = 0;
++    CHECK(windowIndex(ex, ey, ez, 0, 0, 0, want));
++    CHECK(n == want);
++  }
++
++  // A cell on the window boundary has neighbours that fall outside it.
++  size_t edge = 0;
++  CHECK(windowIndex(-2, 0, 0, 0, 0, 0, edge));
++  size_t n = 0;
++  bool anyOutside = false;
++  for (int f = 0; f < kFaceCount; ++f)
++    if (!neighbourIndex(edge, f, n)) anyOutside = true;
++  CHECK(anyOutside);
++
++  // Out-of-range arguments are rejected rather than wrapping.
++  CHECK(!neighbourIndex(kWinCells, 0, n));
++  CHECK(!neighbourIndex(centre, -1, n));
++  CHECK(!neighbourIndex(centre, kFaceCount, n));
++}
++
++void testExposureMatchesOcclusionRule() {
++  uint8_t occ[kWinCells], ocl[kWinCells];
++  std::memset(occ, 0, sizeof(occ));
++  std::memset(ocl, 0, sizeof(ocl));
++
++  size_t c = 0;
++  CHECK(windowIndex(8, 8, 8, 0, 0, 0, c));
++
++  // Nothing around it: every face is exposed.
++  occ[c] = 1;
++  CHECK(isExposed(c, occ, ocl));
++
++  // Surrounded by blocks that do not occlude: still exposed.
++  for (int f = 0; f < kFaceCount; ++f) {
++    size_t n = 0;
++    CHECK(neighbourIndex(c, f, n));
++    occ[n] = 1;
++    ocl[n] = 0;
++  }
++  CHECK(isExposed(c, occ, ocl));
++
++  // Surrounded by blocks that do occlude: fully enclosed, nothing to draw.
++  for (int f = 0; f < kFaceCount; ++f) {
++    size_t n = 0;
++    CHECK(neighbourIndex(c, f, n));
++    ocl[n] = 1;
++  }
++  CHECK(!isExposed(c, occ, ocl));
++
++  // Opening one face makes it worth drawing again.
++  size_t up = 0;
++  CHECK(neighbourIndex(c, 0, up));
++  ocl[up] = 0;
++  CHECK(isExposed(c, occ, ocl));
++
++  // Removing a neighbour entirely has the same effect as making it transparent.
++  ocl[up] = 1;
++  CHECK(!isExposed(c, occ, ocl));
++  occ[up] = 0;
++  CHECK(isExposed(c, occ, ocl));
++
++  // A block on the window edge is exposed by construction: the window is not the world, so a
++  // missing neighbour there must not suppress a face that is genuinely visible.
++  size_t edge = 0;
++  CHECK(windowIndex(-2, 8, 8, 0, 0, 0, edge));
++  for (int f = 0; f < kFaceCount; ++f) {
++    size_t n = 0;
++    if (neighbourIndex(edge, f, n)) {
++      occ[n] = 1;
++      ocl[n] = 1;
++    }
++  }
++  occ[edge] = 1;
++  CHECK(isExposed(edge, occ, ocl));
++
++  // Out of range is not exposed; there is no block there to draw.
++  CHECK(!isExposed(kWinCells, occ, ocl));
++}
++
++void testCursorVisitsEveryBlockExactlyOnce() {
++  BuildCursor cur;
++  cur.start(3, 2, 4);
++  CHECK(cur.phase == BuildCursor::Phase::Window);
++  CHECK(cur.totalBlocks() == 24);
++  CHECK(cur.blocksVisited() == 0);
++
++  cur.beginTessellate();
++  CHECK(cur.phase == BuildCursor::Phase::Tessellate);
++  CHECK(!cur.readyToCommit());
++
++  // Walk the whole range, checking the iteration order is z fastest, then y, then x, and that no
++  // position is visited twice.
++  bool seen[3][2][4];
++  std::memset(seen, 0, sizeof(seen));
++  int steps = 0;
++  do {
++    CHECK(cur.ix >= 0 && cur.ix < 3);
++    CHECK(cur.iy >= 0 && cur.iy < 2);
++    CHECK(cur.iz >= 0 && cur.iz < 4);
++    CHECK(!seen[cur.ix][cur.iy][cur.iz]);
++    seen[cur.ix][cur.iy][cur.iz] = true;
++    ++steps;
++  } while (cur.next());
++
++  CHECK(steps == 24);
++  for (int x = 0; x < 3; ++x)
++    for (int y = 0; y < 2; ++y)
++      for (int z = 0; z < 4; ++z) CHECK(seen[x][y][z]);
++
++  // Only now is the geometry complete and publishable.
++  CHECK(cur.phase == BuildCursor::Phase::Commit);
++  CHECK(cur.readyToCommit());
++  CHECK(cur.blocksVisited() == 24);
++  CHECK(!cur.inFlight());
++  CHECK(!cur.next());
++  cur.markFinished();
++  CHECK(cur.finished());
++}
++
++void testCursorStopsMidChunkWithoutClaimingCompletion() {
++  // The whole point of the cursor: running out of budget leaves the build in Tessellate, so a caller
++  // that checks readyToCommit() cannot publish partial geometry.
++  BuildCursor cur;
++  cur.start(4, 4, 4);
++  cur.beginTessellate();
++
++  int done = 0;
++  while (done < 10 && cur.next()) ++done;
++  CHECK(cur.phase == BuildCursor::Phase::Tessellate);
++  CHECK(!cur.readyToCommit());
++  CHECK(cur.inFlight());
++  CHECK(cur.blocksVisited() == 10);
++
++  // Resuming continues from where it stopped rather than restarting.
++  const int ix = cur.ix, iy = cur.iy, iz = cur.iz;
++  CHECK(cur.next() || cur.readyToCommit());
++  CHECK(cur.ix != ix || cur.iy != iy || cur.iz != iz || cur.readyToCommit());
++}
++
++void testCursorHandlesDegenerateExtents() {
++  BuildCursor cur;
++  cur.start(0, 4, 4);
++  CHECK(cur.totalBlocks() == 0);
++  cur.beginTessellate();
++  // An empty range has nothing to visit, so it is complete immediately rather than stuck.
++  CHECK(cur.readyToCommit());
++  CHECK(!cur.next());
++
++  BuildCursor c2;
++  c2.start(1, 1, 1);
++  c2.beginTessellate();
++  CHECK(c2.phase == BuildCursor::Phase::Tessellate);
++  CHECK(c2.totalBlocks() == 1);
++  CHECK(!c2.next());
++  CHECK(c2.readyToCommit());
++}
++
++void testGeometryBudgetTracksBothCeilings() {
++  GeometryLimits lim;
++  lim.blocks = 10;
++  lim.verts = 100;
++  GeometryBudget b;
++
++  CHECK(!b.exhausted(lim));
++  CHECK(b.blocksLeft(lim) == 10);
++  CHECK(b.vertsLeft(lim) == 100);
++
++  b.addBlocks(4);
++  b.addVerts(30);
++  CHECK(!b.exhausted(lim));
++  CHECK(b.blocksLeft(lim) == 6);
++  CHECK(b.vertsLeft(lim) == 70);
++
++  // Vertices can exhaust the budget while blocks remain.
++  b.addVerts(70);
++  CHECK(b.exhausted(lim));
++  CHECK(b.vertsLeft(lim) == 0);
++  CHECK(b.blocksLeft(lim) == 6);
++
++  // And blocks can exhaust it while vertices remain.
++  b.reset();
++  CHECK(!b.exhausted(lim));
++  b.addBlocks(10);
++  CHECK(b.exhausted(lim));
++  CHECK(b.blocksLeft(lim) == 0);
++  CHECK(b.vertsLeft(lim) == 100);
++
++  // Overshoot clamps to zero rather than wrapping unsigned.
++  b.addBlocks(5);
++  CHECK(b.blocksLeft(lim) == 0);
++}
++}  // namespace
++
++int main() {
++  testWindowIndexMatchesHologramFormula();
++  testNeighbourIndexStaysInsideWindow();
++  testExposureMatchesOcclusionRule();
++  testCursorVisitsEveryBlockExactlyOnce();
++  testCursorStopsMidChunkWithoutClaimingCompletion();
++  testCursorHandlesDegenerateExtents();
++  testGeometryBudgetTracksBothCeilings();
++  std::printf("geometry: %d passed, %d failed\n", gPass, gFails);
++  return gFails ? 1 : 0;
++}
+diff -ruN a/tests/render/lod_test.cpp b/tests/render/lod_test.cpp
+--- a/tests/render/lod_test.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/render/lod_test.cpp	2026-10-24 15:55:18.598330072 +0000
+@@ -0,0 +1,244 @@
++// Phase 1 tests: distance visibility and per-frame workload policy (host, ASan+UBSan).
++//
++// Covers render/HoloLod.hpp. The scheduler is the mechanism that replaces a time budget which was
++// checked only between whole chunk builds; these tests pin the property that made the old guard
++// insufficient, namely that a ceiling is expressed in work the caller can check mid-build.
++//
++// The other thing pinned here is that view-only staleness - camera movement - draws on a separate and
++// smaller allowance than real geometry changes, so walking past a build cannot starve actual edits.
++#include <cstdio>
++#include <string>
++
++#include "render/HoloLod.hpp"
++
++namespace {
++int gFails = 0, gPass = 0;
++#define CHECK(c)                                                                        \
++  do {                                                                                  \
++    if (c) ++gPass;                                                                     \
++    else { ++gFails; std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } \
++  } while (0)
++
++using namespace lm::holo::lod;
++
++Limits smallLimits() {
++  Limits l;
++  l.blocks = 100;
++  l.verts = 1000;
++  l.starts = 2;
++  l.resumes = 3;
++  l.viewBlocks = 25;
++  l.us = 1500;
++  return l;
++}
++
++void testFreshFrameAllowsWork() {
++  Scheduler s(smallLimits());
++  s.beginFrame();
++  CHECK(s.mayWork(Need::World, false));
++  CHECK(s.mayWork(Need::View, false));
++  CHECK(s.mayWork(Need::First, true));
++  CHECK(s.stopReason(Need::World, false) == Stop::None);
++  CHECK(s.blocksLeft(Need::World) == 100);
++  CHECK(s.vertsLeft() == 1000);
++  CHECK(!s.exhausted());
++}
++
++void testBlockCeilingIsEnforceableMidBuild() {
++  // The property the old guard could not provide: the caller can ask before each block, so a single
++  // expensive chunk cannot overrun the frame by more than one block.
++  Scheduler s(smallLimits());
++  s.beginFrame();
++
++  int taken = 0;
++  while (s.mayWork(Need::World, true) && taken < 10000) {
++    s.spend(1, 1, 0, Need::World);
++    ++taken;
++  }
++  CHECK(taken == 100);
++  CHECK(s.stopReason(Need::World, true) == Stop::Blocks);
++  CHECK(s.exhausted());
++  CHECK(s.blocksLeft(Need::World) == 0);
++}
++
++void testVertexCeilingIsIndependent() {
++  Scheduler s(smallLimits());
++  s.beginFrame();
++  // Dense geometry: a few blocks produce many vertices and hit the vertex ceiling first.
++  s.spend(5, 1000, 0, Need::World);
++  CHECK(s.stopReason(Need::World, true) == Stop::Verts);
++  CHECK(s.blocksLeft(Need::World) == 95);
++  CHECK(s.vertsLeft() == 0);
++  CHECK(s.exhausted());
++}
++
++void testViewWorkIsCappedTighterThanWorld() {
++  Scheduler s(smallLimits());
++  s.beginFrame();
++
++  // View-only staleness stops well before the global block ceiling.
++  int view = 0;
++  while (s.mayWork(Need::View, true) && view < 10000) {
++    s.spend(1, 1, 0, Need::View);
++    ++view;
++  }
++  CHECK(view == 25);
++  CHECK(s.stopReason(Need::View, true) == Stop::ViewBlocks);
++  CHECK(!s.exhausted());
++
++  // Real geometry changes are unaffected by what the camera spent.
++  CHECK(s.mayWork(Need::World, true));
++  CHECK(s.blocksLeft(Need::World) == 75);
++  // And a view chunk is still refused, even though global budget remains.
++  CHECK(!s.mayWork(Need::View, true));
++}
++
++void testStartsAndResumesHaveSeparateAllowances() {
++  Scheduler s(smallLimits());
++  s.beginFrame();
++
++  // Two builds may be started...
++  CHECK(s.mayWork(Need::World, false));
++  s.noteTakenOn(false);
++  CHECK(s.mayWork(Need::World, false));
++  s.noteTakenOn(false);
++  // ...but not a third.
++  CHECK(!s.mayWork(Need::World, false));
++  CHECK(s.stopReason(Need::World, false) == Stop::Starts);
++
++  // Resuming an in-flight build draws on a different allowance and is still allowed. This is what
++  // lets a build span frames without being counted as new work every time.
++  CHECK(s.mayWork(Need::World, true));
++  CHECK(s.stopReason(Need::World, true) == Stop::None);
++  s.noteTakenOn(true);
++  s.noteTakenOn(true);
++  CHECK(s.mayWork(Need::World, true));
++  s.noteTakenOn(true);
++  CHECK(!s.mayWork(Need::World, true));
++  CHECK(s.stopReason(Need::World, true) == Stop::Resumes);
++}
++
++void testTimeCeilingIsAdvisoryButRespected() {
++  Scheduler s(smallLimits());
++  s.beginFrame();
++  s.spend(1, 1, 1499, Need::World);
++  CHECK(s.mayWork(Need::World, true));
++  s.spend(1, 1, 1, Need::World);
++  CHECK(!s.mayWork(Need::World, true));
++  CHECK(s.stopReason(Need::World, true) == Stop::Time);
++  // Units remain, so the diagnostics can tell time pressure apart from a work ceiling.
++  CHECK(s.blocksLeft(Need::World) == 98);
++}
++
++void testBeginFrameResetsAccounting() {
++  Scheduler s(smallLimits());
++  s.beginFrame();
++  s.spend(100, 1000, 5000, Need::View);
++  s.noteTakenOn(false);
++  CHECK(s.exhausted());
++
++  s.beginFrame();
++  CHECK(!s.exhausted());
++  CHECK(s.frame().blocks == 0);
++  CHECK(s.frame().verts == 0);
++  CHECK(s.frame().us == 0);
++  CHECK(s.frame().starts == 0);
++  CHECK(s.frame().resumes == 0);
++  CHECK(s.frame().viewBlocks == 0);
++  CHECK(s.mayWork(Need::World, false));
++}
++
++void testLimitsCanBeRetunedWithoutLosingAccounting() {
++  Scheduler s(smallLimits());
++  s.beginFrame();
++  s.spend(100, 0, 0, Need::World);
++  CHECK(s.exhausted());
++  Limits bigger = smallLimits();
++  bigger.blocks = 200;
++  s.setLimits(bigger);
++  // Raising a ceiling mid-frame releases the extra work; the accounting itself is preserved.
++  CHECK(!s.exhausted());
++  CHECK(s.blocksLeft(Need::World) == 100);
++  CHECK(s.frame().blocks == 100);
++}
++
++void testStopNamesAreStable() {
++  // These strings end up in the diagnostics line, so they are part of the interface.
++  CHECK(std::string(stopName(Stop::None)) == "none");
++  CHECK(std::string(stopName(Stop::Blocks)) == "blocks");
++  CHECK(std::string(stopName(Stop::Verts)) == "verts");
++  CHECK(std::string(stopName(Stop::ViewBlocks)) == "view-blocks");
++  CHECK(std::string(stopName(Stop::Starts)) == "starts");
++  CHECK(std::string(stopName(Stop::Resumes)) == "resumes");
++  CHECK(std::string(stopName(Stop::Time)) == "time");
++}
++
++void testNeedOrderingPutsWorldAboveView() {
++  CHECK(Need::First > Need::World);
++  CHECK(Need::World > Need::View);
++  CHECK(Need::View > Need::None);
++  CHECK(!needsWork(Need::None));
++  CHECK(needsWork(Need::View));
++  CHECK(needsWork(Need::World));
++  CHECK(needsWork(Need::First));
++}
++
++void testVisibilityClassification() {
++  VisPolicy p;
++  p.visibleSq = 96.f * 96.f;
++  p.hiddenSq = 160.f * 160.f;
++
++  CHECK(classify(0.f, p) == Vis::Visible);
++  CHECK(classify(95.f * 95.f, p) == Vis::Visible);
++  CHECK(classify(96.f * 96.f, p) == Vis::Visible);
++  CHECK(classify(100.f * 100.f, p) == Vis::Deferred);
++  CHECK(classify(160.f * 160.f, p) == Vis::Deferred);
++  CHECK(classify(161.f * 161.f, p) == Vis::Hidden);
++}
++
++void testViewStalenessNeedsRealMovement() {
++  ViewHysteresis h;
++  h.rebuild = 8.f;
++  h.band = 10.f;
++
++  // Below the threshold the cached culling is still correct, so no rebuild is warranted. This is the
++  // hysteresis that stops a hovering camera re-dirtying the same chunks every frame.
++  CHECK(!viewStaleOnAxis(0.f, h));
++  CHECK(!viewStaleOnAxis(8.f, h));
++  CHECK(viewStaleOnAxis(8.01f, h));
++  CHECK(viewStaleOnAxis(20.f, h));
++}
++
++void testDistantChunksAreNotStaleInPractice() {
++  ViewHysteresis h;
++  h.rebuild = 8.f;
++  h.band = 10.f;
++
++  // A chunk within the cull band can have faces that became visible.
++  CHECK(viewStalenessMatters(20.f, 5.f, h));
++  CHECK(viewStalenessMatters(20.f, 26.f, h));
++  // Beyond band + one chunk extent no face of it can have entered the band.
++  CHECK(!viewStalenessMatters(20.f, 27.f, h));
++  CHECK(!viewStalenessMatters(20.f, 500.f, h));
++  // And no movement means nothing is stale however close the chunk is.
++  CHECK(!viewStalenessMatters(1.f, 0.f, h));
++}
++}  // namespace
++
++int main() {
++  testFreshFrameAllowsWork();
++  testBlockCeilingIsEnforceableMidBuild();
++  testVertexCeilingIsIndependent();
++  testViewWorkIsCappedTighterThanWorld();
++  testStartsAndResumesHaveSeparateAllowances();
++  testTimeCeilingIsAdvisoryButRespected();
++  testBeginFrameResetsAccounting();
++  testLimitsCanBeRetunedWithoutLosingAccounting();
++  testStopNamesAreStable();
++  testNeedOrderingPutsWorldAboveView();
++  testVisibilityClassification();
++  testViewStalenessNeedsRealMovement();
++  testDistantChunksAreNotStaleInPractice();
++  std::printf("lod: %d passed, %d failed\n", gPass, gFails);
++  return gFails ? 1 : 0;
++}
+diff -ruN a/tests/render/meshstate_test.cpp b/tests/render/meshstate_test.cpp
+--- a/tests/render/meshstate_test.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/render/meshstate_test.cpp	2026-10-24 15:55:18.598330072 +0000
+@@ -0,0 +1,223 @@
++// Phase 1 tests: cached mesh storage and invalidation (host, ASan+UBSan).
++//
++// Covers render/HoloMeshState.hpp. The two invariants these exist to protect:
++//
++//   * a chunk that is regenerating keeps drawing the mesh it already had - invalidating or rebuilding
++//     a chunk must never make it stop being drawable;
++//   * a build that has not been committed is never published, so partial geometry cannot reach the
++//     renderer.
++//
++// Both are properties a regression could break silently, which is why they are pinned here rather
++// than left to review.
++#include <cstdio>
++
++#include "render/HoloMeshState.hpp"
++
++namespace {
++int gFails = 0, gPass = 0;
++#define CHECK(c)                                                                        \
++  do {                                                                                  \
++    if (c) ++gPass;                                                                     \
++    else { ++gFails; std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } \
++  } while (0)
++
++using namespace lm::holo::mesh;
++
++void testFreshSlotIsNotDrawable() {
++  SlotState s;
++  CHECK(!s.drawable());
++  CHECK(!s.building);
++  CHECK(s.invalid == InvalidNone);
++  // Nothing has changed, so there is nothing to rebuild either.
++  CHECK(!s.needsRebuild());
++}
++
++void testBuildDoesNotDisturbThePublishedMesh() {
++  SlotState s;
++  CHECK(beginBuild(s, 10));
++  CHECK(commit(s, 11));
++  CHECK(s.drawable());
++  CHECK(s.readyFrame == 11);
++  CHECK(!s.building);
++
++  // The central case: a rebuild starts while the chunk is on screen. The published mesh must survive
++  // the whole build, otherwise the hologram would blank out every time the camera moved.
++  CHECK(beginBuild(s, 50));
++  CHECK(s.building);
++  CHECK(s.drawable());
++  CHECK(s.buildStart == 50);
++  CHECK(s.readyFrame == 11);
++
++  // A second build on the same chunk is refused, so the first one's staging cannot be orphaned.
++  CHECK(!beginBuild(s, 51));
++  CHECK(s.buildStart == 50);
++
++  CHECK(commit(s, 52));
++  CHECK(s.drawable());
++  CHECK(!s.building);
++  CHECK(s.readyFrame == 52);
++}
++
++void testPartialBuildIsNeverPublished() {
++  SlotState s;
++  CHECK(beginBuild(s, 1));
++  // A build in flight with nothing published yet: the chunk must not be drawable, because the only
++  // geometry that exists is incomplete.
++  CHECK(!s.drawable());
++  CHECK(s.building);
++
++  // Abandoning it leaves nothing drawable, which is correct: there was never a complete mesh.
++  abortBuild(s);
++  CHECK(!s.building);
++  CHECK(!s.drawable());
++  // Whatever caused the build is still unaddressed.
++  CHECK(s.hasWorldInvalidation());
++  CHECK(s.needsRebuild());
++}
++
++void testAbortKeepsThePreviousMesh() {
++  SlotState s;
++  CHECK(beginBuild(s, 1));
++  CHECK(commit(s, 2));
++  CHECK(s.drawable());
++
++  // A build that is abandoned part way must not take the working mesh with it.
++  CHECK(beginBuild(s, 100));
++  abortBuild(s);
++  CHECK(!s.building);
++  CHECK(s.drawable());
++  CHECK(s.readyFrame == 2);
++  CHECK(s.needsRebuild());
++}
++
++void testCommitWithoutBuildIsRejected() {
++  SlotState s;
++  // Publishing with no build in flight would mean handing the renderer geometry nobody generated.
++  CHECK(!commit(s, 5));
++  CHECK(!s.drawable());
++  CHECK(!s.building);
++}
++
++void testInvalidationNeverStopsDrawing() {
++  SlotState s;
++  CHECK(beginBuild(s, 1));
++  CHECK(commit(s, 2));
++
++  invalidate(s, InvalidWorld);
++  CHECK(s.drawable());
++  CHECK(s.needsRebuild());
++  CHECK(s.hasWorldInvalidation());
++  CHECK(!s.viewOnly());
++
++  // A view invalidation on top does not demote the world one.
++  invalidate(s, InvalidView);
++  CHECK(s.drawable());
++  CHECK(!s.viewOnly());
++  CHECK(s.hasWorldInvalidation());
++
++  // Clearing just the view part leaves the world part pending.
++  clearInvalid(s, InvalidView);
++  CHECK(s.hasWorldInvalidation());
++  CHECK(!s.viewOnly());
++
++  clearInvalid(s, InvalidWorld);
++  CHECK(s.invalid == InvalidNone);
++  CHECK(!s.needsRebuild());
++  CHECK(s.drawable());
++}
++
++void testViewOnlyIsDistinguishableFromWorld() {
++  // This distinction is what stops camera movement competing with real edits for the rebuild budget.
++  SlotState s;
++  CHECK(beginBuild(s, 1));
++  CHECK(commit(s, 2));
++
++  invalidate(s, InvalidView);
++  CHECK(s.viewOnly());
++  CHECK(!s.hasWorldInvalidation());
++  CHECK(s.needsRebuild());
++
++  // Once a world change arrives the chunk is no longer merely stale.
++  invalidate(s, InvalidWorld);
++  CHECK(!s.viewOnly());
++  CHECK(s.hasWorldInvalidation());
++}
++
++void testNeedsRebuildIsFalseWhileBuilding() {
++  SlotState s;
++  CHECK(beginBuild(s, 1));
++  CHECK(commit(s, 2));
++  invalidate(s, InvalidWorld);
++  CHECK(s.needsRebuild());
++
++  // A build already covers the pending invalidation, so it must not be counted twice.
++  CHECK(beginBuild(s, 3));
++  CHECK(!s.needsRebuild());
++  CHECK(s.drawable());
++}
++
++void testCommitClearsStaleInvalidation() {
++  SlotState s;
++  CHECK(beginBuild(s, 1));
++  CHECK(commit(s, 2));
++  invalidate(s, InvalidView);
++  CHECK(s.invalid != InvalidNone);
++
++  // The build ran against the state current when it finished, so invalidation recorded before that
++  // point is already covered by the new mesh.
++  CHECK(beginBuild(s, 3));
++  CHECK(commit(s, 4));
++  CHECK(s.invalid == InvalidNone);
++}
++
++void testDiscardPublishedDropsEverything() {
++  SlotState s;
++  CHECK(beginBuild(s, 1));
++  CHECK(commit(s, 2));
++  CHECK(s.drawable());
++
++  // Used when the EGL context changed: the cached handles belong to a dead context, so keeping them
++  // drawable would submit unusable GPU objects.
++  discardPublished(s);
++  CHECK(!s.drawable());
++  CHECK(!s.building);
++  CHECK(s.hasWorldInvalidation());
++  CHECK(s.needsRebuild());
++}
++
++void testStalledBuildIsDetectable() {
++  SlotState s;
++  CHECK(beginBuild(s, 100));
++  CHECK(!buildStalled(s, 100, 60));
++  CHECK(!buildStalled(s, 159, 60));
++  CHECK(buildStalled(s, 160, 60));
++  CHECK(buildStalled(s, 900, 60));
++
++  // A chunk that is not building is never stalled, however old.
++  SlotState idle;
++  CHECK(!buildStalled(idle, 100000, 60));
++
++  // Frame counter wraparound must not make a fresh build look stalled: the comparison is unsigned
++  // subtraction, so a build started just before the wrap is measured correctly.
++  SlotState w;
++  CHECK(beginBuild(w, 0xFFFFFFF0u));
++  CHECK(!buildStalled(w, 0x00000010u, 60));
++  CHECK(buildStalled(w, 0x00000010u, 16));
++}
++}  // namespace
++
++int main() {
++  testFreshSlotIsNotDrawable();
++  testBuildDoesNotDisturbThePublishedMesh();
++  testPartialBuildIsNeverPublished();
++  testAbortKeepsThePreviousMesh();
++  testCommitWithoutBuildIsRejected();
++  testInvalidationNeverStopsDrawing();
++  testViewOnlyIsDistinguishableFromWorld();
++  testNeedsRebuildIsFalseWhileBuilding();
++  testCommitClearsStaleInvalidation();
++  testDiscardPublishedDropsEverything();
++  testStalledBuildIsDetectable();
++  std::printf("meshstate: %d passed, %d failed\n", gPass, gFails);
++  return gFails ? 1 : 0;
++}

@@ -1,0 +1,1236 @@
+diff -ruN a/src/Game.hpp b/src/Game.hpp
+--- a/src/Game.hpp	2026-10-24 14:17:51.392539504 +0000
++++ b/src/Game.hpp	2026-10-24 14:33:39.325327405 +0000
+@@ -169,4 +169,16 @@
+ inline constexpr unsigned Actor_mStateVector = 0x208;
+ inline constexpr unsigned Actor_mRotation = 0x218;
+ inline constexpr unsigned Dimension_mBlockSource = 208;
++
++// Tessellator / BlockTessellator fields used by the hologram mesh path. These were bare literals at
++// their use sites in Hologram.cpp (t + 0x10, t + 0x70, t + 0x290, t + 0x1cc, bt + 0x78); they are
++// centralised here UNCHANGED so the five values have one spelling and can be pinned by a host test.
++// Centralising does not validate them: no libminecraftpe.so was available to check any of these
++// against, so binary validation is PENDING for all five. Each entry names what the code does with the
++// field, which is the evidence available - not proof that the offset is right for the target build.
++inline constexpr unsigned Tess_mVertexRun = 0x10;      // pair of pointers bounding the vertex run
++inline constexpr unsigned Tess_mColorRun = 0x70;       // pair of pointers bounding the colour run
++inline constexpr unsigned Tess_mVertexCount = 0x290;   // int, compared against the cut threshold
++inline constexpr unsigned Tess_mOffset = 0x1cc;        // float[3], the tessellation origin
++inline constexpr unsigned BlockTess_mRenderFlag = 0x78;  // uint32, written from Block::getBlockRenderFlag
+ }  
+diff -ruN a/src/Hologram.cpp b/src/Hologram.cpp
+--- a/src/Hologram.cpp	2026-10-24 14:17:51.396539525 +0000
++++ b/src/Hologram.cpp	2026-10-24 14:43:07.648197934 +0000
+@@ -760,6 +760,43 @@
+ }
+ 
+ constexpr int kWin = 20;
++
++// ---- Phase 0 diagnostics helpers. Declared here, above their first use in getBlockDetour. ----
++
++// Monotonic microseconds, for the phase timers. Separate from nowMs() because these are durations, not
++// timestamps, and integer maths avoids drift over long sessions.
++inline uint64_t monoUs() {
++  timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) / 1000ull;
++}
++
++// RAII phase timer: adds the scope's duration to one perf counter on exit. Mirrors the existing
++// CpuScope in drawStructure - no allocation, no formatting, and completely inert when perf is off
++// (one relaxed load in the constructor, nothing at all in the destructor).
++struct UsScope {
++  perf::Counter c;
++  uint64_t t0;
++  bool on;
++  explicit UsScope(perf::Counter cc) : c(cc), t0(0), on(perf::on()) {
++    if (on) t0 = monoUs();
++  }
++  ~UsScope() {
++    if (on) perf::count(c, monoUs() - t0);
++  }
++  UsScope(const UsScope &) = delete;
++  UsScope &operator=(const UsScope &) = delete;
++};
++
++// Hook-chain wait statistics for the two detours below. Read by the perf log; written only by the
++// threads that run those detours. See HookChain.hpp for why the wait itself cannot be bounded.
++lm::hookchain::SpinStats gChainSpin;
++
++// A wait longer than this means the install window lasted far longer than the hook framework documents
++// (it promises microseconds), so it is worth one rate-limited warning. Deliberately generous: this must
++// not fire during a normal install.
++constexpr uint64_t kChainWaitWarnUs = 5000;  // 5 ms
++
+ std::atomic<bool> gWinOn{false};
+ pthread_t gWinTid{};
+ uintptr_t gWinRegion = 0;
+@@ -784,9 +821,11 @@
+       }
+     }
+   }
+-  void *orig;
+-  while (!(orig = __atomic_load_n(&gGetBlockOrig, __ATOMIC_ACQUIRE))) {
+-  }
++  // Loaded per call, never cached: rebuildChain() rewrites this slot whenever any mod hooks or unhooks
++  // getBlock. chainNext() waits out a null slot (the install window) and now records the wait instead of
++  // spinning silently - see HookChain.hpp for why waiting, rather than returning, is the safe behaviour.
++  perf::count(perf::GetBlockCalls);
++  void *orig = lm::hookchain::chainNext(gGetBlockOrig, &gChainSpin);
+   return reinterpret_cast<GetBlockFn>(orig)(region, pos);
+ }
+ 
+@@ -928,7 +967,7 @@
+ }
+ 
+ void texSetOffset(uintptr_t tess, float x, float y, float z) {
+-  float *o = reinterpret_cast<float *>(tess + 0x1cc);
++  float *o = reinterpret_cast<float *>(tess + off::Tess_mOffset);
+   o[0] = x; o[1] = y; o[2] = z;
+ }
+ 
+@@ -944,7 +983,7 @@
+ void texCut(TexFrame &f) {
+   if (!f.begun) return;
+   int n = 0;
+-  rd(f.tess + 0x290, n);
++  rd(f.tess + off::Tess_mVertexCount, n);
+   if (n > 0 && f.out) {
+     static const char kName[] = "Structura";
+     perf::count(perf::MeshRebuild);
+@@ -964,12 +1003,12 @@
+   if (!f.begun) texBegin(f);
+   const uintptr_t t = f.tess;
+   uintptr_t pv[2], cv[2];
+-  if (!rd(t + 0x10, pv) || !rd(t + 0x70, cv)) return -1;
++  if (!rd(t + off::Tess_mVertexRun, pv) || !rd(t + off::Tess_mColorRun, cv)) return -1;
+   const size_t pb = (pv[1] - pv[0]) / sizeof(Vec3), cb = (cv[1] - cv[0]) / 4;
+-  *reinterpret_cast<uint32_t *>(f.bt + 0x78) = uint32_t(sBlockFlag(reinterpret_cast<void *>(block)) & 0xFF);
++  *reinterpret_cast<uint32_t *>(f.bt + off::BlockTess_mRenderFlag) = uint32_t(sBlockFlag(reinterpret_cast<void *>(block)) & 0xFF);
+   const BlockPos pos{wx, wy, wz};
+   sTessInWorld(reinterpret_cast<void *>(f.bt), reinterpret_cast<void *>(t), reinterpret_cast<void *>(block), pos, 0);
+-  if (!rd(t + 0x10, pv) || !rd(t + 0x70, cv)) return -1;
++  if (!rd(t + off::Tess_mVertexRun, pv) || !rd(t + off::Tess_mColorRun, cv)) return -1;
+   const size_t pa = (pv[1] - pv[0]) / sizeof(Vec3), ca = (cv[1] - cv[0]) / 4;
+   
+   
+@@ -992,13 +1031,17 @@
+       area += 0.5f * std::sqrt(nx * nx + ny * ny + nz * nz);
+     }
+     if (bad || area < 0.02f) {
++      // Rejected by validation (non-finite, out of the block's +-1..2 range, or degenerate area). Counted
++      // because the validation's COST is folded into HoloTessUs and cannot be timed apart from it; the
++      // outcome is still observable this way.
++      perf::count(perf::HoloBadVerts, uint64_t(pa - pb));
+       for (size_t i = pb + 1; i < pa; ++i) p[i] = p[pb];
+       if (ca > cb) {
+         uint32_t *c = reinterpret_cast<uint32_t *>(untag(cv[0]));
+         for (size_t i = cb; i < ca; ++i) c[i] &= 0x00FFFFFFu;
+       }
+       int n = 0;
+-      rd(t + 0x290, n);
++      rd(t + off::Tess_mVertexCount, n);
+       if (n >= f.threshold) texCut(f);
+       return -1;
+     }
+@@ -1069,8 +1112,9 @@
+   }
+   ++f.blocks;
+   f.verts += uint32_t(pa - pb);
++  perf::count(perf::HoloValidVerts, uint64_t(pa - pb));
+   int n = 0;
+-  rd(t + 0x290, n);
++  rd(t + off::Tess_mVertexCount, n);
+   if (n >= f.threshold) texCut(f);
+   return int(pa - pb);
+ }
+@@ -1091,8 +1135,14 @@
+     for (int i = 0; i < 4; ++i) M[12 + i] += M[i] * tx + M[4 + i] * ty + M[8 + i] * tz;
+     char pad[0x58]{};
+     
++    // Cached-mesh submission: the engine renders a mesh Structura already built, so this is a call into
++    // the engine rather than vertex pushing. Timed here rather than at the call site so the count and the
++    // duration always describe the same set of submissions.
++    const uint64_t subT0 = perf::on() ? monoUs() : 0;
+     sMeshRender(m->b, static_cast<char *>(f.ctx) + 0x10, mat ? mat : f.mat, noTex ? nullptr : f.texVariant, 0, 0, pad,
+                 nullptr);
++    if (subT0) perf::count(perf::HoloSubmitUs, monoUs() - subT0);
++    perf::count(perf::HoloMeshSubmits);
+     status().meshCalls.fetch_add(1, std::memory_order_relaxed);
+   }
+   sMatPop(&ref);
+@@ -1103,6 +1153,7 @@
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+ }
++
+ std::atomic<int> gApiBox[6];
+ std::atomic<double> gApiBoxAt{-1e9};
+ 
+@@ -1530,7 +1581,10 @@
+       hs::rt().buildGen.fetch_add(1, std::memory_order_relaxed);
+       freeAllChunks();
+     } else if (a8 != lastAlpha) {
+-      for (auto &kv : gChunks) kv.second.dirty = true;  
++      for (auto &kv : gChunks) {
++        kv.second.dirty = true;  
++        perf::count(perf::InvAlpha);
++      }
+     } else if (pf[0] != sx0 || pf[1] != sx1 || pf[2] != sy0 || pf[3] != sy1 || pf[4] != sz0 || pf[5] != sz1) {
+       
+       const int nb[6] = {sx0, sx1, sy0, sy1, sz0, sz1};
+@@ -1548,7 +1602,10 @@
+             if (q[a] * 16 <= hi && q[a] * 16 + 15 >= lo) hit = true;
+           }
+         }
+-        if (hit) kv.second.dirty = true;
++        if (hit) {
++          kv.second.dirty = true;
++          perf::count(perf::InvFilter);
++        }
+       }
+     }
+     lastAlpha = a8;
+@@ -1631,6 +1688,9 @@
+             continue;
+           auto it = gChunks.find(chunkKey(qx >> 4, qy >> 4, qz >> 4));
+           if (it != gChunks.end()) it->second.dirty = true;
++          // Counted per chunk actually invalidated, not per block change: one kind change can fan out to
++          // up to 8 chunks, and it is the chunk count that drives the rebuild cost.
++          if (it != gChunks.end()) perf::count(perf::InvCompare);
+         }
+   };
+ 
+@@ -1641,6 +1701,7 @@
+   if (evOn) gEvStore.bind(C.get(), C->gen ^ (C->epoch << 40));
+   const bool vidxOk = T.vidx.size() == T.volume();
+   if (C && region && sGetBlock && gAir && vx0 <= vx1 && vy0 <= vy1 && vz0 <= vz1) {
++    UsScope cmpScope(perf::HoloCmpUs);
+     const size_t bx = size_t(vx1 - vx0 + 1), by = size_t(vy1 - vy0 + 1), bz = size_t(vz1 - vz0 + 1), vol = bx * by * bz;
+     if (gCmp.gen != gen) { gCmp.gen = gen; gCmp.farSweep.pos = 0; }
+     const bool exact = statesReady && T.vidx.size() == T.volume();
+@@ -1855,6 +1916,8 @@
+ 
+   
+   auto buildChunk = [&](int qx, int qy, int qz, ChunkMeshes &cm) {
++    const uint64_t buildT0 = monoUs();
++    const bool wasBuilt = cm.built;   // a rebuild is strictly more expensive than a first build
+     static uintptr_t win[kWin * kWin * kWin];
+     static uint8_t winOcc[kWin * kWin * kWin];
+     // Reused scratch (render thread only): after the swaps below they hold the chunk's previous, already
+@@ -1882,6 +1945,10 @@
+     const int wx0 = std::max(ox - 2, bx0), wx1 = std::min(ox + 17, bx1);
+     const int wy0 = std::max(oy - 2, by0), wy1 = std::min(oy + 17, by1);
+     const int wz0 = std::max(oz - 2, bz0), wz1 = std::min(oz + 17, bz1);
++    // Chunk-window population: the +-2 block window fill. Timed as a pair rather than with an RAII scope
++    // because the loop body is a triple-nested for and a brace-wrapped scope around it would be easy to
++    // mis-balance; the manual form is also free when perf is off.
++    const uint64_t winT0 = perf::on() ? monoUs() : 0;
+     for (int wx = wx0; wx <= wx1; ++wx)
+       for (int wy = wy0; wy <= wy1; ++wy)
+         for (int wz = wz0; wz <= wz1; ++wz) {
+@@ -1922,6 +1989,7 @@
+           if (!gTexNoPrefill)
+             sBTSetCache(reinterpret_cast<void *>(tf->bt), reinterpret_cast<void *>(sb), BlockPos{wx, wy, wz});
+         }
++    if (winT0) perf::count(perf::HoloWindowUs, monoUs() - winT0);
+     gWinX0 = ox - 2; gWinY0 = oy - 2; gWinZ0 = oz - 2;
+     gWinRegion = tf->region;
+     gWinTid = pthread_self();
+@@ -1931,6 +1999,13 @@
+     const int bz0c = std::max(oz, sz0), bz1c = std::min(oz + 15, sz1);
+     
+     const int sxs = cam.x < ox + 8 ? -1 : 1, sys = cam.y < oy + 8 ? -1 : 1, szs = cam.z < oz + 8 ? -1 : 1;
++    // Per-block tessellation. This span covers texBlock for every block in the chunk, which is where the
++    // engine's TessellateInWorld runs AND where texBlock validates the vertices it produced. The two are
++    // deliberately not timed apart: separating them needs a clock read per block, and at up to 16^3
++    // blocks per chunk that instrumentation would cost more than the work it measures. The exact
++    // validation OUTCOME is counted instead (HoloValidVerts / HoloBadVerts), so a validation problem is
++    // still visible even though its time is folded into this figure.
++    const uint64_t tessT0 = perf::on() ? monoUs() : 0;
+     for (int ix = 0; ix <= bx1c - bx0c; ++ix)
+       for (int iy = 0; iy <= by1c - by0c; ++iy)
+         for (int iz = 0; iz <= bz1c - bz0c; ++iz) {
+@@ -2004,6 +2079,7 @@
+                                            : "door: broken geometry, thin-panel fallback")
+                                 : (nv == 0 ? "no geometry from BlockTessellator (block entity?)" : "broken geometry"));
+         }
++    if (tessT0) perf::count(perf::HoloTessUs, monoUs() - tessT0);
+     texCut(*tf);
+     tf->out = nullptr;
+     
+@@ -2015,6 +2091,8 @@
+     } else if (tf->verts > verts0) {
+       gTexEmptyChunks = 0;
+     }
++    // Mesh construction + cache swap: retiring the chunk's previous meshes and installing the new ones.
++    const uint64_t meshT0 = perf::on() ? monoUs() : 0;
+     freeChunk(cm);  
+     cm.meshes.swap(fresh);
+     gMeshTotal += uint32_t(cm.meshes.size());
+@@ -2025,6 +2103,11 @@
+     cm.built = true;
+     cm.dirty = false;
+     cm.builtFrame = gFrame;
++    if (meshT0) perf::count(perf::HoloMeshUs, monoUs() - meshT0);
++    // A rebuild (chunk was already built) is strictly more expensive than a first build, so the two are
++    // counted apart: a rising rebuild rate means churn, not growth.
++    if (wasBuilt) perf::count(perf::HoloRebuilds);
++    perf::countMax(perf::HoloBuildMaxUs, monoUs() - buildT0);
+   };
+ 
+   
+@@ -2046,7 +2129,11 @@
+           for (int ax = 0; ax < 3; ++ax) {
+             if (std::fabs(cv[ax] - bv[ax]) <= kCullRebuild) continue;
+             const float lo = std::min(cv[ax], bv[ax]) - kCullBand - 1.f, hi = std::max(cv[ax], bv[ax]) + kCullBand + 1.f;
+-            if (o3[ax] + 16 >= lo && o3[ax] <= hi) { cm.dirty = true; break; }
++            if (o3[ax] + 16 >= lo && o3[ax] <= hi) {
++              cm.dirty = true;
++              perf::count(perf::InvCull);
++              break;
++            }
+           }
+         }
+         const float ex = a * 16 + 8 - cam.x, ey = b * 16 + 8 - cam.y, ez = c * 16 + 8 - cam.z;
+@@ -2159,7 +2246,13 @@
+   st.texChunks.store(ready, std::memory_order_relaxed);
+   st.texBlocks.store(pending, std::memory_order_relaxed);
+   st.texZero.store(tf->zero, std::memory_order_relaxed);
+-  st.texVerts.store(nMeshes, std::memory_order_relaxed);
++  // Counter-correctness fix. This field was being stored `nMeshes` - a MESH count - despite being named
++  // texVerts. Verified before changing it: a full-tree grep finds no reader of texVerts anywhere, so no
++  // consumer depended on the old (wrong) value, and the mesh count is already reported separately as
++  // gOut.meshesDrawn above. tf->verts is the real per-frame textured vertex total, accumulated in
++  // texBlock and reset each frame by texFrameSetup. tf is non-null here: the !texOn path returns early,
++  // and texOn requires tf.
++  st.texVerts.store(tf->verts, std::memory_order_relaxed);
+ }
+ 
+ 
+@@ -2357,9 +2450,14 @@
+ }
+ 
+ void renderLevelDetour(void *self, void *screenCtx, void *fro) {
+-  void *orig;
+-  while (!(orig = __atomic_load_n(&gRenderLevelOrig, __ATOMIC_ACQUIRE))) {  
+-  }
++  // Whole-detour wall time, measured before the engine call so the engine's own RenderLevel is included:
++  // this is the number that has to stay inside the frame budget, not just our part of it.
++  UsScope hookScope(perf::HoloHookUs);
++  const uint64_t frameT0 = monoUs();
++  // Loaded per call, never cached: rebuildChain() rewrites this slot whenever any mod hooks or unhooks
++  // RenderLevel. chainNext() waits out a null slot (the install window) and records the wait instead of
++  // spinning silently - see HookChain.hpp for why waiting, rather than returning, is the safe behaviour.
++  void *orig = lm::hookchain::chainNext(gRenderLevelOrig, &gChainSpin);
+   reinterpret_cast<RenderLevelFn>(orig)(self, screenCtx, fro);  
+ 
+   auto &st = status();
+@@ -2465,7 +2563,7 @@
+   struct TessOffsetGuard {
+     float *o;
+     float v[3];
+-    explicit TessOffsetGuard(uintptr_t t) : o(reinterpret_cast<float *>(t + 0x1cc)) { std::memcpy(v, o, sizeof(v)); }
++    explicit TessOffsetGuard(uintptr_t t) : o(reinterpret_cast<float *>(t + off::Tess_mOffset)) { std::memcpy(v, o, sizeof(v)); }
+     ~TessOffsetGuard() { std::memcpy(o, v, sizeof(v)); }
+   } tessGuard(tess);
+   
+@@ -2499,7 +2597,10 @@
+     static int seenStyle = -1;
+     if (seenStyle != s.holoStyle.load()) {   // 风格变了：旧网格（带剔除/半透明）必须重建
+       seenStyle = s.holoStyle.load();
+-      for (auto &kv : gChunks) kv.second.dirty = true;
++      for (auto &kv : gChunks) {
++        kv.second.dirty = true;
++        perf::count(perf::InvStyle);
++      }
+     }
+     const bool solidStyle = s.holoStyle.load() == 1;
+     const bool cyanStyle = s.holoStyle.load() == cyan::kStyle;
+@@ -2631,21 +2732,56 @@
+   st.faceMatMask.store(mask, std::memory_order_relaxed);
+   
+   st.hasLineMat.store(lineMat != nullptr, std::memory_order_relaxed);
+-  flushLines(t, screenCtx, lineMat, cam);
+-  perf::count(perf::HoloImmQuads, gQuads.size());
+-  flushQuads(t, screenCtx, faceMat, cam, s.twoSided.load());
+-  // Error Vision last, camera-relative (cam = 0): projected toward the eye so it passes the material's own
+-  // depth test through walls; no GL state is changed for it (the experimental xrayLines pass still applies
+-  // to line flushes only when that separate setting is on, and restores what it changed).
+-  if (!gEvLines.empty() || !gEvQuads.empty()) {
+-    const Vec3 origin{0.f, 0.f, 0.f};
+-    flushQuads(t, screenCtx, faceMat, origin, true, gEvQuads);
+-    flushLines(t, screenCtx, lineMat, origin, gEvLines);
+-  }
++  {
++    UsScope immScope(perf::HoloImmUs);
++    flushLines(t, screenCtx, lineMat, cam);
++    perf::count(perf::HoloImmQuads, gQuads.size());
++    perf::count(perf::HoloImmLines, gLines.size());
++    flushQuads(t, screenCtx, faceMat, cam, s.twoSided.load());
++    // Error Vision last, camera-relative (cam = 0): projected toward the eye so it passes the material's own
++    // depth test through walls; no GL state is changed for it (the experimental xrayLines pass still applies
++    // to line flushes only when that separate setting is on, and restores what it changed).
++    if (!gEvLines.empty() || !gEvQuads.empty()) {
++      const Vec3 origin{0.f, 0.f, 0.f};
++      flushQuads(t, screenCtx, faceMat, origin, true, gEvQuads);
++      flushLines(t, screenCtx, lineMat, origin, gEvLines);
++    }
++  }
++  // Vertices actually pushed to the tessellator this frame: 4 per quad (8 when twoSided doubles them)
++  // and 2 per line, matching what flushQuads/flushLines emit. Counted from our own buffers, so it is a
++  // real count and not an estimate; it excludes the cached-mesh path, whose vertices live inside the
++  // engine's mesh and are not readable without an unvalidated offset.
++  perf::count(perf::HoloVerts, uint64_t(gQuads.size()) * (s.twoSided.load(std::memory_order_relaxed) ? 8u : 4u) +
++                                   uint64_t(gLines.size()) * 2u);
+   st.drawnQuads.store(gQuads.size(), std::memory_order_relaxed);
+   st.drawnLines.store(gLines.size(), std::memory_order_relaxed);
+   if (colorHolder) std::memcpy(colorHolder, saved, sizeof(saved));
+   st.renderStage.store(5, std::memory_order_relaxed);  
++  // Drain the hook-chain wait statistics into the perf counters once per frame. Draining here rather than
++  // inside chainNext keeps the hot path to a single relaxed exchange, and puts the rate-limited warning
++  // on the render thread only where gLog is already used.
++  if (perf::on()) {
++    const uint64_t waits = gChainSpin.waits.exchange(0, std::memory_order_relaxed);
++    const uint64_t maxUs = gChainSpin.maxWaitUs.exchange(0, std::memory_order_relaxed);
++    if (waits) perf::count(perf::ChainWaits, waits);
++    if (maxUs) perf::countMax(perf::ChainSpinMaxUs, maxUs);
++    // Rate-limited: a wait is expected during the install window, so this only fires when a wait is long
++    // enough to mean the window lasted far longer than the hook framework documents. Logged at most once
++    // per second, so a pathological state cannot flood the log from the render thread.
++    if (maxUs > kChainWaitWarnUs && gLog) {
++      static int64_t lastWarn = 0;
++      const int64_t nowWarn = hs::monoMs();
++      if (nowWarn - lastWarn > 1000) {
++        lastWarn = nowWarn;
++        gLog->warn("hologram: hook-chain slot was null for {} us ({} wait(s) this frame); another mod is "
++                   "rebuilding the hook chain or the install window is unusually long",
++                   static_cast<unsigned long long>(maxUs), static_cast<unsigned long long>(waits));
++      }
++    }
++  }
++  // One frame-duration sample per rendered frame, for the p50/p95/p99/max line. Recorded last so it
++  // covers the whole detour including the engine's own RenderLevel.
++  perf::noteFrameUs(monoUs() - frameT0);
+ }
+ 
+ }  
+diff -ruN a/src/HookChain.hpp b/src/HookChain.hpp
+--- a/src/HookChain.hpp	2026-10-24 14:17:51.396539525 +0000
++++ b/src/HookChain.hpp	2026-10-24 14:32:54.865102861 +0000
+@@ -11,17 +11,83 @@
+ //   * when it is running, the hook exists, so a null slot is only that install window: wait it out.
+ // chainNext() is only for code running inside the detour of that slot. Code that may run when the hook
+ // failed must use chainPeek() and handle nullptr.
++//
++// PHASE 0 NOTE ON THE WAIT ITSELF
++// -------------------------------
++// The wait below is unbounded by necessity, and that is a deliberate conclusion, not an oversight:
++//
++//   1. Why the slot can be null: only the install window described above. The target is already patched
++//      to the chain when our detour first runs; rebuildChain() stores our slot microseconds later.
++//   2. Is there a valid fallback? No. The slot holds either the next mod's detour or the engine
++//      trampoline. Neither is knowable from anywhere else, and a detour cannot reconstruct it.
++//   3. So the only alternatives to waiting are (a) calling a null or stale pointer - immediate crash or
++//      silent corruption, or (b) returning without calling through - which skips the engine's own
++//      RenderLevel / BlockSource::getBlock and every other mod in the chain, changing game behaviour.
++//      Both are worse than waiting, so neither is done.
++//
++// What Phase 0 does change: the wait no longer burns a core, and it is now observable.
++//   * after kSpinBeforeYield attempts the waiter calls sched_yield(), so a long window cannot starve
++//     the very thread that is about to store the slot (the old loop was a pure busy spin);
++//   * every wait that actually had to spin is counted, and the longest one is recorded, so an abnormal
++//     install or chain rebuild shows up in the perf log instead of presenting only as a freeze.
++//
++// Still unresolved and intentionally left so: if rebuildChain() ever fails to store the slot at all, this
++// waits forever. Detecting that would require a timeout, and a timeout has no safe action to take on
++// expiry (see 3 above). The correct fix belongs in the hook framework - store the slot before patching
++// the target - not here. Reported, not papered over.
++#include <sched.h>
++#include <time.h>
++
++#include <atomic>
++#include <cstdint>
++
+ namespace lm::hookchain {
+ 
++// Attempts before yielding. The documented window is microseconds, so a normal wait never reaches this;
++// reaching it means the window is far longer than the framework promises and is worth reporting.
++constexpr unsigned kSpinBeforeYield = 64;
++
++struct SpinStats {
++  std::atomic<uint64_t> waits{0};      // calls that found a null slot and had to wait
++  std::atomic<uint64_t> maxWaitUs{0};  // longest such wait since it was last read
++};
++
++inline uint64_t spinMonoUs() {
++  struct timespec ts {};
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) / 1000ull;
++}
++
++inline void noteMaxUs(std::atomic<uint64_t> &slot, uint64_t v) {
++  uint64_t cur = slot.load(std::memory_order_relaxed);
++  while (v > cur && !slot.compare_exchange_weak(cur, v, std::memory_order_relaxed, std::memory_order_relaxed)) {
++  }
++}
++
+ template <class Fn>
+ inline Fn chainPeek(Fn const &slot) {
+   return __atomic_load_n(&slot, __ATOMIC_ACQUIRE);
+ }
+ 
++// Wait out a null slot and return the current chain element. Semantics are unchanged from the original
++// busy loop - it still always returns a valid pointer and never caches one - but a wait that outlives
++// kSpinBeforeYield attempts yields the CPU and is recorded in `stats` when given.
+ template <class Fn>
+-inline Fn chainNext(Fn const &slot) {
++inline Fn chainNext(Fn const &slot, SpinStats *stats = nullptr) {
+   Fn f;
++  if ((f = __atomic_load_n(&slot, __ATOMIC_ACQUIRE))) return f;  // overwhelmingly the common case
++
++  const uint64_t t0 = stats ? spinMonoUs() : 0;
++  unsigned spins = 0;
+   while (!(f = __atomic_load_n(&slot, __ATOMIC_ACQUIRE))) {
++    if (++spins >= kSpinBeforeYield) {
++      sched_yield();
++      spins = 0;
++    }
++  }
++  if (stats) {
++    stats->waits.fetch_add(1, std::memory_order_relaxed);
++    noteMaxUs(stats->maxWaitUs, spinMonoUs() - t0);
+   }
+   return f;
+ }
+diff -ruN a/src/Perf.cpp b/src/Perf.cpp
+--- a/src/Perf.cpp	2026-10-24 14:17:51.400539545 +0000
++++ b/src/Perf.cpp	2026-10-24 14:32:03.368842728 +0000
+@@ -1,5 +1,6 @@
+ #include "Perf.hpp"
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstring>
+@@ -8,6 +9,8 @@
+ 
+ std::atomic_bool gOn{false};
+ std::atomic<uint64_t> gCnt[CounterCount];
++std::atomic<uint32_t> gFrameUs[kFrameSamples];
++std::atomic<uint32_t> gFrameCount{0};
+ 
+ namespace {
+ uint64_t gLast[CounterCount] = {};
+@@ -16,6 +19,43 @@
+   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+       .count();
+ }
++
++// Snapshot of the window takeLine() just consumed, kept so takePhaseLine() reports the SAME window
++// instead of a second, differently-aligned one. Written and read on the UI thread only.
++struct Window {
++  bool valid = false;
++  uint64_t d[CounterCount] = {};
++  double secs = 1.0;
++  uint32_t frames = 0;      // RenderHook deltas = frames in the window
++  uint32_t samples = 0;     // frame-duration samples collected
++  uint32_t p50 = 0, p95 = 0, p99 = 0, fmax = 0;
++  bool saturated = false;   // more frames than the ring holds: percentiles cover the newest kFrameSamples
++} gWin;
++
++// Nearest-rank percentile over an ascending-sorted sample array. rank is 1-based and clamped, so an
++// empty array can never be indexed and n==1 returns that single sample for every percentile.
++uint32_t nearestRank(const uint32_t *sorted, uint32_t n, double pct) {
++  if (n == 0) return 0;
++  unsigned long long rank = (unsigned long long)(pct / 100.0 * double(n) + 0.999999);  // ceil
++  if (rank < 1) rank = 1;
++  if (rank > n) rank = n;
++  return sorted[rank - 1];
++}
++
++// Collect and sort the samples recorded since the last report. Bounded by kFrameSamples, so the buffer
++// is on the stack and nothing is allocated. Returns the number of valid samples.
++uint32_t collectSamples(uint32_t *out, uint32_t cap) {
++  const uint32_t total = gFrameCount.load(std::memory_order_relaxed);
++  const uint32_t n = total < cap ? total : cap;
++  // Read the newest n slots. The writer may advance while we copy; each slot is a single relaxed load,
++  // so a concurrent write can only substitute one recent frame for another.
++  for (uint32_t k = 0; k < n; ++k) {
++    const uint32_t idx = (total - n + k) % cap;
++    out[k] = gFrameUs[idx].load(std::memory_order_relaxed);
++  }
++  std::sort(out, out + n);
++  return n;
++}
+ }  
+ 
+ void setEnabled(bool v) {
+@@ -23,8 +63,15 @@
+   if (v) {
+     for (int i = 0; i < CounterCount; ++i) gLast[i] = gCnt[i].load(std::memory_order_relaxed);
+     gLastAt = nowMs();
++    // Reset the frame-time ring so the first reported window holds no pre-enable frames. The max-type
++    // counters are windowed too: they are re-based to 0 here and re-read as maxima within the window.
++    gFrameCount.store(0, std::memory_order_relaxed);
++    for (unsigned i = 0; i < kFrameSamples; ++i) gFrameUs[i].store(0, std::memory_order_relaxed);
++    gCnt[HoloBuildMaxUs].store(0, std::memory_order_relaxed);
++    gCnt[ChainSpinMaxUs].store(0, std::memory_order_relaxed);
+   }
+   gOn.store(v, std::memory_order_relaxed);
++  gWin.valid = false;
+ }
+ 
+ bool takeLine(char *out, unsigned outSize) {
+@@ -41,8 +88,13 @@
+   gLastAt = now;
+   const double frames = d[RenderHook] ? double(d[RenderHook]) : 1.0;
+   auto pf = [&](Counter c) { return double(d[c]) / frames; };
+-  
+-  
++
++  // Frame-duration percentiles for this exact window.
++  uint32_t samplesBuf[kFrameSamples];
++  const uint32_t total = gFrameCount.load(std::memory_order_relaxed);
++  const uint32_t ns = collectSamples(samplesBuf, kFrameSamples);
++  gFrameCount.store(0, std::memory_order_relaxed);  // consume: next window starts empty
++
+   std::snprintf(out, outSize,
+                 "[perf] frame_id=%llu fps=%.1f frame_time_ms=%.2f render_hook_calls=%.2f player_update_calls=%.2f "
+                 "gui_draw_calls=%.3f gui_commands=%.2f allocations_this_frame=%.3f layout_rebuilds=%.3f "
+@@ -70,6 +122,49 @@
+     if (used + 1 < outSize)
+       std::snprintf(out + used, outSize - used, " | safe_reads_per_s=%.0f", double(d[SafeReads]) / secs);
+   }
++
++  // Publish the window for takePhaseLine().
++  std::memcpy(gWin.d, d, sizeof(d));
++  gWin.secs = secs > 0.0 ? secs : 1.0;
++  gWin.frames = uint32_t(d[RenderHook]);
++  gWin.samples = ns;
++  gWin.p50 = nearestRank(samplesBuf, ns, 50.0);
++  gWin.p95 = nearestRank(samplesBuf, ns, 95.0);
++  gWin.p99 = nearestRank(samplesBuf, ns, 99.0);
++  gWin.fmax = ns ? samplesBuf[ns - 1] : 0;
++  gWin.saturated = total > kFrameSamples;
++  gWin.valid = true;
++  return true;
++}
++
++bool takePhaseLine(char *out, unsigned outSize) {
++  if (!gWin.valid || outSize == 0) return false;
++  gWin.valid = false;
++  const uint64_t *d = gWin.d;
++  const double fr = gWin.frames ? double(gWin.frames) : 1.0;
++  auto pf = [&](Counter c) { return double(d[c]) / fr; };
++
++  // Timings are per frame (us/frame) so they are directly comparable with holo_cpu_ms. Counts are per
++  // second, matching the existing "_per_s" convention. Maxima are window maxima, not averages, and are
++  // labelled _max to keep the distinction visible in the log.
++  std::snprintf(out, outSize,
++                "[perf:phase] hook_us=%.1f cmp_us=%.1f window_us=%.1f tess_us=%.1f mesh_us=%.1f submit_us=%.1f "
++                "imm_us=%.1f build_max_us=%llu spin_max_us=%llu | rebuilds_per_s=%.1f inv_cmp_per_s=%.1f "
++                "inv_cull_per_s=%.1f inv_alpha_per_s=%.1f inv_style_per_s=%.1f inv_filter_per_s=%.1f | "
++                "imm_quads_per_s=%.0f imm_lines_per_s=%.0f mesh_submits_per_s=%.1f verts_per_s=%.0f "
++                "valid_verts_per_s=%.0f bad_verts_per_s=%.0f getblock_calls_per_s=%.0f chain_waits_per_s=%.1f | "
++                "frame_ms p50=%.2f p95=%.2f p99=%.2f max=%.2f samples=%u%s",
++                pf(HoloHookUs), pf(HoloCmpUs), pf(HoloWindowUs), pf(HoloTessUs), pf(HoloMeshUs), pf(HoloSubmitUs),
++                pf(HoloImmUs), static_cast<unsigned long long>(d[HoloBuildMaxUs]),
++                static_cast<unsigned long long>(d[ChainSpinMaxUs]), double(d[HoloRebuilds]) / gWin.secs,
++                double(d[InvCompare]) / gWin.secs, double(d[InvCull]) / gWin.secs, double(d[InvAlpha]) / gWin.secs,
++                double(d[InvStyle]) / gWin.secs, double(d[InvFilter]) / gWin.secs,
++                double(d[HoloImmQuads]) / gWin.secs, double(d[HoloImmLines]) / gWin.secs,
++                double(d[HoloMeshSubmits]) / gWin.secs, double(d[HoloVerts]) / gWin.secs,
++                double(d[HoloValidVerts]) / gWin.secs, double(d[HoloBadVerts]) / gWin.secs,
++                double(d[GetBlockCalls]) / gWin.secs, double(d[ChainWaits]) / gWin.secs, gWin.p50 / 1000.0,
++                gWin.p95 / 1000.0, gWin.p99 / 1000.0, gWin.fmax / 1000.0, gWin.samples,
++                gWin.saturated ? " (ring saturated: newest 512 only)" : "");
+   return true;
+ }
+ 
+diff -ruN a/src/Perf.hpp b/src/Perf.hpp
+--- a/src/Perf.hpp	2026-10-24 14:17:51.400539545 +0000
++++ b/src/Perf.hpp	2026-10-24 14:31:29.920673799 +0000
+@@ -1,12 +1,13 @@
+ #pragma once
+ 
+-
+-
+ #include <atomic>
+ #include <cstdint>
+ 
+ namespace lm::perf {
+ 
++// Counter indices are part of the log contract: takeLine() prints named fields from fixed positions and
++// the UI/log consumers match on those names. NEW counters are therefore appended just before
++// CounterCount, never inserted, so every existing index keeps its meaning.
+ enum Counter : int {
+   RenderHook,     
+   PlayerUpdate,   
+@@ -32,20 +33,84 @@
+   SafeReads,      // guarded memory reads (process_vm_readv syscalls), all threads
+   SvCalls,        // block state lookups (stateValue)
+   SvHits,         // ... answered from the bounded state cache
++
++  // ---- Phase 0 (1.26.52) phase-level diagnostics. Appended; existing indices untouched. ----
++  // Timings are microseconds accumulated on the render thread, reported per frame like HoloCpuUs.
++  HoloHookUs,     // whole renderLevelDetour, including the engine's own RenderLevel call
++  HoloCmpUs,      // structure comparison (compareAt over the near + far sweeps)
++  HoloWindowUs,   // chunk-window population (the +-2 block window fill inside buildChunk)
++  HoloTessUs,     // per-block tessellation loop inside buildChunk. INCLUDES the vertex validation
++                  // that texBlock performs on the vertices it just produced: the two cannot be timed
++                  // apart without a clock read per block, whose cost would exceed the work measured.
++                  // HoloValidVerts / HoloBadVerts give the exact validation outcome instead.
++  HoloMeshUs,     // mesh construction + cache swap at the end of buildChunk
++  HoloSubmitUs,   // cached mesh submission (drawMesh -> sMeshRender)
++  HoloImmUs,      // immediate-mode submission (flushQuads + flushLines)
++  HoloBuildMaxUs, // longest single buildChunk seen since the last report (max, not a sum)
++  HoloRebuilds,   // chunk rebuilds (a chunk that was already built and got rebuilt)
++  InvCompare,     // chunks invalidated: comparison found a kind change (markDirty)
++  InvCull,        // chunks invalidated: camera left the cull band
++  InvAlpha,       // chunks invalidated: alpha / tint changed (all chunks)
++  InvStyle,       // chunks invalidated: holo style changed (all chunks)
++  InvFilter,      // chunks invalidated: filter box moved
++  HoloImmLines,   // immediate-mode lines submitted
++  HoloMeshSubmits,// cached mesh submissions (drawMesh calls that reached sMeshRender)
++  HoloVerts,      // vertices submitted, cached + immediate (counted from our own buffers)
++  HoloValidVerts, // tessellated vertices that passed the finite/bounds/area validation
++  HoloBadVerts,   // tessellated vertices rejected by that validation (degenerate / out of range)
++  GetBlockCalls,  // calls through the BlockSource::getBlock detour (all threads)
++  ChainWaits,     // hook-chain slot reads that had to wait out a null slot
++  ChainSpinMaxUs, // longest such wait seen since the last report (max, not a sum)
+   CounterCount
+ };
+ 
++// Frame-time sampling.
++//
++//   interval   one sample per RenderLevel detour invocation, i.e. one per rendered frame, recorded
++//              only while perf logging is enabled;
++//   capacity   kFrameSamples, a fixed ring - bounded memory, no allocation, ever;
++//   percentiles nearest-rank on a sorted snapshot: rank = ceil(P/100 * N), 1-based, clamped to [1, N];
++//   reset      the ring is cleared by setEnabled(true); takeLine() consumes the samples it reports on,
++//              so each printed line covers exactly the frames since the previous line.
++//
++// Written by the render thread, read by the UI thread (uiLoop -> takeLine). Slots and the write index
++// are relaxed atomics: a torn read can only ever surface a slightly stale sample, never an invalid one,
++// and the reader re-clamps the count it actually saw.
++constexpr unsigned kFrameSamples = 512;
++
+ extern std::atomic_bool gOn;
+ extern std::atomic<uint64_t> gCnt[CounterCount];
++extern std::atomic<uint32_t> gFrameUs[kFrameSamples];
++extern std::atomic<uint32_t> gFrameCount;  // total samples recorded since the last reset (monotonic)
+ 
+ inline bool on() { return gOn.load(std::memory_order_relaxed); }
+ inline void count(Counter c, uint64_t n = 1) {
+   if (gOn.load(std::memory_order_relaxed)) gCnt[c].fetch_add(n, std::memory_order_relaxed);
+ }
+ 
++// Track a maximum (longest buildChunk, longest hook-chain wait). CAS loop: only writers on the render
++// thread contend, and the common case is a single load that fails the comparison.
++inline void countMax(Counter c, uint64_t v) {
++  if (!gOn.load(std::memory_order_relaxed)) return;
++  uint64_t cur = gCnt[c].load(std::memory_order_relaxed);
++  while (v > cur &&
++         !gCnt[c].compare_exchange_weak(cur, v, std::memory_order_relaxed, std::memory_order_relaxed)) {
++  }
++}
+ 
++// Record one frame duration. Zero and absurd values are dropped rather than stored, so a percentile is
++// never computed over a sample that does not represent a real frame.
++inline void noteFrameUs(uint64_t us) {
++  if (!gOn.load(std::memory_order_relaxed)) return;
++  if (us == 0 || us > 60000000ull) return;  // >60 s is a clock artefact, not a frame
++  const uint32_t i = gFrameCount.fetch_add(1, std::memory_order_relaxed) % kFrameSamples;
++  gFrameUs[i].store(uint32_t(us), std::memory_order_relaxed);
++}
+ 
+ void setEnabled(bool on);
+ bool takeLine(char *out, unsigned outSize);
++// Phase-0 detail line, formatted from the snapshot takeLine() just took. Returns false when there is
++// nothing new to report, so the caller can print it unconditionally.
++bool takePhaseLine(char *out, unsigned outSize);
+ 
+ }  
+diff -ruN a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp	2026-10-24 14:17:51.408539586 +0000
++++ b/src/main.cpp	2026-10-24 14:43:32.036321122 +0000
+@@ -887,6 +887,10 @@
+       {
+         char line[1024];
+         if (perf::takeLine(line, sizeof(line))) mSelf.getLogger().info("{}", line);
++        // Phase 0 detail line. Formatted from the window takeLine() just consumed, so the two lines always
++        // describe the same frames; takePhaseLine() returns false when takeLine() did not fire this pass.
++        char phaseLine[1024];
++        if (perf::takePhaseLine(phaseLine, sizeof(phaseLine))) mSelf.getLogger().info("{}", phaseLine);
+       }
+       
+       if (nowMs() - lastSave > 2000) {
+diff -ruN a/tests/compat/hookchain_phase0_test.cpp b/tests/compat/hookchain_phase0_test.cpp
+--- a/tests/compat/hookchain_phase0_test.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/compat/hookchain_phase0_test.cpp	2026-10-24 14:46:08.377110777 +0000
+@@ -0,0 +1,148 @@
++// Phase 0 tests: hook-chain wait behaviour (host, ASan+UBSan).
++//
++// Complements compat/hookchain_test.cpp, which covers the pre-existing chain model. These cover what
++// Phase 0 changed in chainNext(): the wait is still unbounded and still always returns a valid pointer,
++// but it now yields the CPU after kSpinBeforeYield attempts and records the wait in SpinStats.
++//
++// The two invariants that must survive any change here, restated as tests:
++//   * a call arriving during the install window WAITS and then reaches the game (never returns null,
++//     never skips the call-through);
++//   * the slot is read on every call, never cached.
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <thread>
++
++#include "../../src/HookChain.hpp"
++
++namespace {
++int gFails = 0, gPass = 0;
++#define CHECK(c)                                                                        \
++  do {                                                                                  \
++    if (c) ++gPass;                                                                     \
++    else { ++gFails; std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } \
++  } while (0)
++
++using Fn = int (*)(int);
++using namespace lm::hookchain;
++
++std::atomic<int> gGameCalls{0};
++int game(int v) { gGameCalls.fetch_add(1); return v + 1000; }
++
++Fn gSlot = nullptr;
++int ourDetour(int v, SpinStats *st) { return chainNext(gSlot, st)(v) + 1; }
++
++void testFastPathDoesNotRecordAWait() {
++  gSlot = &game;
++  gGameCalls = 0;
++  SpinStats st;
++  CHECK(ourDetour(5, &st) == 1006);
++  CHECK(gGameCalls == 1);
++  // The overwhelmingly common case: the slot is already populated, so nothing is recorded and the
++  // stats path is never entered.
++  CHECK(st.waits.load() == 0);
++  CHECK(st.maxWaitUs.load() == 0);
++}
++
++void testWaitIsRecordedAndStillCallsThrough() {
++  gSlot = nullptr;
++  gGameCalls = 0;
++  SpinStats st;
++  std::atomic<bool> started{false};
++  int got = 0;
++  std::thread caller([&] {
++    started = true;
++    got = ourDetour(5, &st);
++  });
++  while (!started) {
++  }
++  // Long enough to force the waiter well past kSpinBeforeYield, so the yielding path is exercised.
++  std::this_thread::sleep_for(std::chrono::milliseconds(30));
++  __atomic_store_n(&gSlot, &game, __ATOMIC_RELEASE);
++  caller.join();
++
++  // Invariant 1: the call still reaches the game exactly once, with the right result.
++  CHECK(got == 1006);
++  CHECK(gGameCalls == 1);
++  // Invariant 2: the wait was observed, not silently absorbed.
++  CHECK(st.waits.load() == 1);
++  // A ~30 ms window must register as a non-trivial wait (monotonic us).
++  CHECK(st.maxWaitUs.load() > 1000);
++}
++
++void testStatsOptional() {
++  // chainNext() with no stats must behave exactly like the original busy loop.
++  gSlot = nullptr;
++  gGameCalls = 0;
++  std::atomic<bool> started{false};
++  int got = 0;
++  std::thread caller([&] {
++    started = true;
++    got = chainNext(gSlot)(5) + 1;
++  });
++  while (!started) {
++  }
++  std::this_thread::sleep_for(std::chrono::milliseconds(10));
++  __atomic_store_n(&gSlot, &game, __ATOMIC_RELEASE);
++  caller.join();
++  CHECK(got == 1006);
++  CHECK(gGameCalls == 1);
++}
++
++void testSlotRereadEveryCall() {
++  // A cached copy would miss this: the slot is rewritten between the two calls and the second call must
++  // follow the new chain element.
++  SpinStats st;
++  gGameCalls = 0;
++  gSlot = &game;
++  CHECK(chainNext(gSlot, &st)(1) == 1001);
++
++  static std::atomic<int> otherCalls{0};
++  otherCalls = 0;
++  auto other = +[](int v) { otherCalls.fetch_add(1); return v + 2000; };
++  __atomic_store_n(&gSlot, other, __ATOMIC_RELEASE);
++  CHECK(chainNext(gSlot, &st)(1) == 2001);
++  CHECK(otherCalls == 1);
++  CHECK(gGameCalls == 1);  // the game was NOT called the second time
++}
++
++void testManyWaitsAccumulate() {
++  gSlot = nullptr;
++  SpinStats st;
++  constexpr int kRounds = 8;
++  std::atomic<bool> stop{false};
++  std::atomic<int> completed{0};
++  // A waiter that repeatedly finds a null slot, and a writer that fills and clears it.
++  std::thread waiter([&] {
++    while (!stop.load()) {
++      chainNext(gSlot, &st)(0);
++      completed.fetch_add(1);
++    }
++  });
++  for (int i = 0; i < kRounds; ++i) {
++    __atomic_store_n(&gSlot, static_cast<Fn>(nullptr), __ATOMIC_RELEASE);
++    std::this_thread::sleep_for(std::chrono::milliseconds(3));
++    __atomic_store_n(&gSlot, &game, __ATOMIC_RELEASE);
++    std::this_thread::sleep_for(std::chrono::milliseconds(3));
++  }
++  stop = true;
++  __atomic_store_n(&gSlot, &game, __ATOMIC_RELEASE);
++  waiter.join();
++
++  // Every completed call went through the chain, and the waits that occurred were all counted.
++  CHECK(completed.load() > 0);
++  CHECK(st.waits.load() > 0);
++  CHECK(st.waits.load() <= uint64_t(completed.load()));
++  CHECK(st.maxWaitUs.load() > 0);
++}
++}  // namespace
++
++int main() {
++  testFastPathDoesNotRecordAWait();
++  testWaitIsRecordedAndStillCallsThrough();
++  testStatsOptional();
++  testSlotRereadEveryCall();
++  testManyWaitsAccumulate();
++  std::printf("hookchain_phase0: %d passed, %d failed\n", gPass, gFails);
++  return gFails ? 1 : 0;
++}
+diff -ruN a/tests/compat/offsets_test.cpp b/tests/compat/offsets_test.cpp
+--- a/tests/compat/offsets_test.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/compat/offsets_test.cpp	2026-10-24 14:46:38.985265388 +0000
+@@ -0,0 +1,64 @@
++// Phase 0 tests: the centralised engine offsets (host, no binary needed).
++//
++// Scope, stated plainly: this does NOT validate any offset against Minecraft. No libminecraftpe.so was
++// available, so binary validation remains PENDING for every value here. What this does guarantee is the
++// thing centralisation could otherwise silently break - that moving the five literals out of
++// Hologram.cpp into lm::off preserved each value exactly. The right-hand sides below are the literals as
++// they appeared at their use sites before Phase 0; if anyone edits a centralised constant, the
++// static_assert fails at compile time instead of the offset drifting unnoticed.
++#include <cstdio>
++
++#include "../../src/Game.hpp"
++
++// Values as they were written inline in Hologram.cpp before centralisation.
++static_assert(lm::off::Tess_mVertexRun == 0x10, "was `t + 0x10` at the texBlock vertex-run reads");
++static_assert(lm::off::Tess_mColorRun == 0x70, "was `t + 0x70` at the texBlock colour-run reads");
++static_assert(lm::off::Tess_mVertexCount == 0x290, "was `t + 0x290` in texCut and the texBlock cut check");
++static_assert(lm::off::Tess_mOffset == 0x1cc, "was `tess + 0x1cc` in texSetOffset and TessOffsetGuard");
++static_assert(lm::off::BlockTess_mRenderFlag == 0x78, "was `f.bt + 0x78` at the BlockTessellator flag write");
++
++// The offsets that were ALREADY centralised must not have moved either: they are read on the render hot
++// path and a silent change here would be a crash or a wrong camera.
++static_assert(lm::off::LevelRenderer_mLevelRendererPlayer == 0x420, "pre-existing");
++static_assert(lm::off::LevelRendererPlayer_mCamPos == 0x628, "pre-existing");
++static_assert(lm::off::ScreenContext_mTessellator == 0xB8, "pre-existing");
++static_assert(lm::off::ScreenContext_mColorHolder == 0x30, "pre-existing");
++static_assert(lm::off::Actor_mDimension == 448, "pre-existing");
++static_assert(lm::off::Actor_mStateVector == 0x208, "pre-existing");
++static_assert(lm::off::Actor_mRotation == 0x218, "pre-existing");
++static_assert(lm::off::Dimension_mBlockSource == 208, "pre-existing");
++static_assert(lm::off::MaterialGroup_mRenderMaterialGroup == 32, "pre-existing");
++static_assert(lm::off::VT_RenderMaterialGroup_getMaterial == 2, "pre-existing");
++static_assert(lm::off::VT_ClientInstance_getLocalPlayer == 32, "pre-existing");
++static_assert(lm::off::LRP_mat_selection_overlay == 0x1030, "pre-existing");
++static_assert(lm::off::LRP_mat_selection_overlay_opaque == 0x1040, "pre-existing");
++static_assert(lm::off::LRP_mat_selection_overlay_double_sided == 0x1050, "pre-existing");
++static_assert(lm::off::LRP_mat_cracks_overlay == 0x1060, "pre-existing");
++static_assert(lm::off::LRP_mat_selection_box == 0x1090, "pre-existing");
++
++namespace {
++int gFails = 0, gPass = 0;
++#define CHECK(c)                                                                        \
++  do {                                                                                  \
++    if (c) ++gPass;                                                                     \
++    else { ++gFails; std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } \
++  } while (0)
++}  // namespace
++
++int main() {
++  // Runtime mirror of the static_asserts, so the test reports a count rather than only failing to build.
++  CHECK(lm::off::Tess_mVertexRun == 0x10);
++  CHECK(lm::off::Tess_mColorRun == 0x70);
++  CHECK(lm::off::Tess_mVertexCount == 0x290);
++  CHECK(lm::off::Tess_mOffset == 0x1cc);
++  CHECK(lm::off::BlockTess_mRenderFlag == 0x78);
++  CHECK(lm::off::LevelRenderer_mLevelRendererPlayer == 0x420);
++  CHECK(lm::off::LevelRendererPlayer_mCamPos == 0x628);
++  CHECK(lm::off::ScreenContext_mTessellator == 0xB8);
++  CHECK(lm::off::ScreenContext_mColorHolder == 0x30);
++  CHECK(lm::off::Actor_mDimension == 448);
++  CHECK(lm::off::Dimension_mBlockSource == 208);
++  std::printf("offsets: %d passed, %d failed (binary validation PENDING - no libminecraftpe.so)\n", gPass,
++              gFails);
++  return gFails ? 1 : 0;
++}
+diff -ruN a/tests/perf_test.cpp b/tests/perf_test.cpp
+--- a/tests/perf_test.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/perf_test.cpp	2026-10-24 14:45:19.172862257 +0000
+@@ -0,0 +1,244 @@
++// Phase 0 tests: perf counter semantics and frame-time percentiles (host, ASan+UBSan).
++//
++// These cover what Phase 0 added:
++//   * new counters do not disturb the indices or the printed fields of the existing ones;
++//   * count() / countMax() / noteFrameUs() behave as documented;
++//   * the percentile ring is bounded, rejects invalid samples, and computes nearest-rank correctly;
++//   * takeLine() still emits the pre-Phase-0 fields unchanged, and takePhaseLine() describes the same
++//     window rather than a second, differently-aligned one.
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++#include "../src/Perf.hpp"
++
++namespace {
++int gFails = 0, gPass = 0;
++#define CHECK(c)                                                                        \
++  do {                                                                                  \
++    if (c) ++gPass;                                                                     \
++    else { ++gFails; std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } \
++  } while (0)
++
++using namespace lm::perf;
++
++// setEnabled() only resets the ring on a false->true transition (Perf.cpp returns early when the value is
++// unchanged, which is correct: uiLoop re-asserts the same value every pass and must not clear the window).
++// Tests that need a clean window therefore have to cycle it explicitly.
++void resetWindow() {
++  setEnabled(false);
++  setEnabled(true);
++  for (int i = 0; i < CounterCount; ++i) gCnt[i].store(0);
++}
++
++// The pre-Phase-0 log line, captured field by field so a regression in an EXISTING field is caught even
++// though many new fields were appended after it.
++bool hasField(const char *line, const char *name) { return std::strstr(line, name) != nullptr; }
++
++void testExistingCountersUnchanged() {
++  // Appending must not move any pre-existing counter. These are the indices the old log line depended on.
++  CHECK(RenderHook == 0);
++  CHECK(PlayerUpdate == 1);
++  CHECK(HoloCpuUs == 10);
++  CHECK(HoloCompares == 11);
++  CHECK(HoloBuilds == 12);
++  CHECK(HoloImmQuads == 13);
++  CHECK(SafeReads == 20);
++  CHECK(SvCalls == 21);
++  CHECK(SvHits == 22);
++  // The Phase 0 block starts immediately after the last pre-existing counter.
++  CHECK(HoloHookUs == 23);
++  CHECK(ChainSpinMaxUs == CounterCount - 1);
++  CHECK(CounterCount > 23);
++}
++
++void testCountGatedByEnable() {
++  setEnabled(false);
++  gCnt[HoloHookUs].store(0);
++  count(HoloHookUs, 1234);
++  CHECK(gCnt[HoloHookUs].load() == 0);  // off: instrumentation must be free, i.e. no increment
++
++  setEnabled(true);
++  gCnt[HoloHookUs].store(0);
++  count(HoloHookUs, 1234);
++  CHECK(gCnt[HoloHookUs].load() == 1234);
++  count(HoloHookUs);  // default n == 1
++  CHECK(gCnt[HoloHookUs].load() == 1235);
++}
++
++void testCountMaxIsMaximumNotSum() {
++  setEnabled(true);
++  gCnt[HoloBuildMaxUs].store(0);
++  countMax(HoloBuildMaxUs, 500);
++  countMax(HoloBuildMaxUs, 900);
++  countMax(HoloBuildMaxUs, 100);  // smaller: must NOT lower it and must NOT add to it
++  CHECK(gCnt[HoloBuildMaxUs].load() == 900);
++  countMax(HoloBuildMaxUs, 1200);
++  CHECK(gCnt[HoloBuildMaxUs].load() == 1200);
++
++  setEnabled(false);
++  gCnt[HoloBuildMaxUs].store(7);
++  countMax(HoloBuildMaxUs, 99999);
++  CHECK(gCnt[HoloBuildMaxUs].load() == 7);  // gated off, like count()
++}
++
++void testFrameSamplesRejectInvalid() {
++  setEnabled(true);  // resets the ring
++  CHECK(gFrameCount.load() == 0);
++
++  noteFrameUs(0);           // zero: not a real frame
++  CHECK(gFrameCount.load() == 0);
++  noteFrameUs(60000001ull);  // >60 s: clock artefact
++  CHECK(gFrameCount.load() == 0);
++
++  noteFrameUs(16000);
++  CHECK(gFrameCount.load() == 1);
++  CHECK(gFrameUs[0].load() == 16000);
++
++  setEnabled(false);
++  const uint32_t before = gFrameCount.load();
++  noteFrameUs(16000);
++  CHECK(gFrameCount.load() == before);  // gated off
++}
++
++void testRingIsBoundedAndWraps() {
++  resetWindow();
++  for (unsigned i = 0; i < kFrameSamples * 2 + 37; ++i) noteFrameUs(1000 + i);
++  // The counter is monotonic (so the window length is knowable) but the ring never grows past capacity.
++  CHECK(gFrameCount.load() == kFrameSamples * 2 + 37);
++  // Newest sample landed at index (count-1) % capacity.
++  CHECK(gFrameUs[(kFrameSamples * 2 + 36) % kFrameSamples].load() == 1000 + kFrameSamples * 2 + 36);
++}
++
++// Drive takeLine()/takePhaseLine() and assert on the printed text. The cadence is 1 s, so the first call
++// after enabling is the one that produces a line.
++void testEnableIsIdempotentAndOnlyResetsOnTransition() {
++  resetWindow();
++  noteFrameUs(16000);
++  CHECK(gFrameCount.load() == 1);
++  setEnabled(true);                    // same value again: must NOT clear the window
++  CHECK(gFrameCount.load() == 1);
++  noteFrameUs(16000);
++  CHECK(gFrameCount.load() == 2);
++  setEnabled(false);
++  setEnabled(true);                    // real transition: window cleared
++  CHECK(gFrameCount.load() == 0);
++}
++
++void testLines() {
++  resetWindow();
++  // A known frame-time distribution: 100 samples, 1..100 ms.
++  for (uint32_t i = 1; i <= 100; ++i) noteFrameUs(i * 1000u);
++  count(RenderHook, 100);
++  count(HoloHookUs, 100 * 500);
++  count(HoloBuildMaxUs, 0);
++  countMax(HoloBuildMaxUs, 4200);
++
++  char line[2048] = {};
++  // takeLine() enforces a >=1 s window; spin the clock by calling until it fires (bounded).
++  bool got = false;
++  for (int attempt = 0; attempt < 400 && !got; ++attempt) {
++    got = takeLine(line, sizeof(line));
++    if (!got) {
++      struct timespec ts {0, 5 * 1000 * 1000};
++      nanosleep(&ts, nullptr);
++    }
++  }
++  CHECK(got);
++  if (!got) return;
++
++  // Pre-Phase-0 fields must still be present and still named the same.
++  CHECK(hasField(line, "[perf] frame_id="));
++  CHECK(hasField(line, "fps="));
++  CHECK(hasField(line, "frame_time_ms="));
++  CHECK(hasField(line, "render_hook_calls="));
++  CHECK(hasField(line, "holo_cpu_ms="));
++  CHECK(hasField(line, "holo_compares="));
++  CHECK(hasField(line, "holo_chunk_builds="));
++  CHECK(hasField(line, "holo_imm_quads="));
++  CHECK(hasField(line, "safe_reads_per_s="));
++
++  // The Phase 0 line describes the same window.
++  char pl[2048] = {};
++  CHECK(takePhaseLine(pl, sizeof(pl)));
++  CHECK(hasField(pl, "[perf:phase]"));
++  CHECK(hasField(pl, "hook_us="));
++  CHECK(hasField(pl, "build_max_us="));
++  CHECK(hasField(pl, "frame_ms p50="));
++  CHECK(hasField(pl, "samples=100"));
++
++  // Nearest-rank over 1..100 ms: p50 -> rank 50 -> 50 ms, p95 -> rank 95 -> 95 ms,
++  // p99 -> rank 99 -> 99 ms, max -> 100 ms.
++  CHECK(hasField(pl, "p50=50.00"));
++  CHECK(hasField(pl, "p95=95.00"));
++  CHECK(hasField(pl, "p99=99.00"));
++  CHECK(hasField(pl, "max=100.00"));
++  // The window maximum is reported as a maximum, not folded into the average.
++  CHECK(hasField(pl, "build_max_us=4200"));
++
++  // Consumed: a second call has nothing new.
++  char pl2[64] = {};
++  CHECK(!takePhaseLine(pl2, sizeof(pl2)));
++}
++
++void testSingleSamplePercentiles() {
++  resetWindow();
++  noteFrameUs(33333);  // one sample only
++  count(RenderHook, 1);
++  char line[2048] = {};
++  bool got = false;
++  for (int attempt = 0; attempt < 400 && !got; ++attempt) {
++    got = takeLine(line, sizeof(line));
++    if (!got) {
++      struct timespec ts {0, 5 * 1000 * 1000};
++      nanosleep(&ts, nullptr);
++    }
++  }
++  CHECK(got);
++  if (!got) return;
++  char pl[2048] = {};
++  CHECK(takePhaseLine(pl, sizeof(pl)));
++  // n==1: every percentile is that sample, and no out-of-range index is possible.
++  CHECK(hasField(pl, "p50=33.33"));
++  CHECK(hasField(pl, "p95=33.33"));
++  CHECK(hasField(pl, "p99=33.33"));
++  CHECK(hasField(pl, "max=33.33"));
++  CHECK(hasField(pl, "samples=1"));
++}
++
++void testNoSamplesDoesNotDivideByZero() {
++  resetWindow();
++  // No noteFrameUs at all.
++  char line[2048] = {};
++  bool got = false;
++  for (int attempt = 0; attempt < 400 && !got; ++attempt) {
++    got = takeLine(line, sizeof(line));
++    if (!got) {
++      struct timespec ts {0, 5 * 1000 * 1000};
++      nanosleep(&ts, nullptr);
++    }
++  }
++  CHECK(got);
++  if (!got) return;
++  char pl[2048] = {};
++  CHECK(takePhaseLine(pl, sizeof(pl)));
++  CHECK(hasField(pl, "samples=0"));
++  CHECK(hasField(pl, "p50=0.00"));
++  CHECK(hasField(pl, "max=0.00"));
++}
++}  // namespace
++
++int main() {
++  testExistingCountersUnchanged();
++  testCountGatedByEnable();
++  testCountMaxIsMaximumNotSum();
++  testFrameSamplesRejectInvalid();
++  testRingIsBoundedAndWraps();
++  testEnableIsIdempotentAndOnlyResetsOnTransition();
++  testLines();
++  testSingleSamplePercentiles();
++  testNoSamplesDoesNotDivideByZero();
++  lm::perf::setEnabled(false);
++  std::printf("perf: %d passed, %d failed\n", gPass, gFails);
++  return gFails ? 1 : 0;
++}
